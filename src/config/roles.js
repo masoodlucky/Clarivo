@@ -1,0 +1,68 @@
+/**
+ * Clarivo RBAC Roles & Permissions
+ * 6 roles across Firm-side and Client-side users.
+ * Matches SRS v2.0 Section 6 — RBAC Matrix.
+ */
+
+export const ROLES = {
+  SUPER_ADMIN: 'SUPER_ADMIN',
+  FIRM_ADMIN: 'FIRM_ADMIN',
+  ANALYST: 'ANALYST',
+  CLIENT_ADMIN: 'CLIENT_ADMIN',
+  CLIENT_VIEWER: 'CLIENT_VIEWER',
+  CLIENT_TECHNICAL: 'CLIENT_TECHNICAL',
+}
+
+export const ROLE_LABELS = {
+  [ROLES.SUPER_ADMIN]: 'Super Admin',
+  [ROLES.FIRM_ADMIN]: 'Firm Admin',
+  [ROLES.ANALYST]: 'Analyst',
+  [ROLES.CLIENT_ADMIN]: 'Client Admin',
+  [ROLES.CLIENT_VIEWER]: 'Client Viewer',
+  [ROLES.CLIENT_TECHNICAL]: 'Client Technical',
+}
+
+export const FIRM_ROLES = [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN, ROLES.ANALYST]
+export const CLIENT_ROLES = [ROLES.CLIENT_ADMIN, ROLES.CLIENT_VIEWER, ROLES.CLIENT_TECHNICAL]
+
+export const PERMISSIONS = {
+  UPLOAD_REPORT: [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN, ROLES.ANALYST],
+  VIEW_TECHNICAL_VIEW: [
+    ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN, ROLES.ANALYST,
+    ROLES.CLIENT_ADMIN, ROLES.CLIENT_TECHNICAL,
+  ],
+  VIEW_EXECUTIVE_VIEW: Object.values(ROLES),
+  APPROVE_XAI: [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN, ROLES.ANALYST],
+  VIEW_NVD_REPORT: [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN, ROLES.ANALYST],
+  CONFIGURE_DEPLOYMENT: [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN],
+  UPDATE_FINDING_STATUS: [
+    ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN, ROLES.ANALYST,
+    ROLES.CLIENT_TECHNICAL,
+  ],
+  UPLOAD_REMEDIATION_PROOF: [ROLES.CLIENT_ADMIN, ROLES.CLIENT_TECHNICAL],
+  VIEW_AUDIT_LOGS: [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN],
+  MANAGE_TENANTS: [ROLES.SUPER_ADMIN],
+  MANAGE_FIRM_USERS: [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN],
+  VIEW_DEPLOYMENT_HEALTH: [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN],
+  VIEW_PII_AUDIT: [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN],
+  EXPORT_DATA: [ROLES.SUPER_ADMIN, ROLES.FIRM_ADMIN],
+}
+
+/**
+ * Check if a role has a specific permission
+ * @param {string} permission - Permission key from PERMISSIONS
+ * @param {string} userRole - User's role from ROLES
+ * @returns {boolean}
+ */
+export const canDo = (permission, userRole) =>
+  PERMISSIONS[permission]?.includes(userRole) ?? false
+
+/**
+ * Check if role is a firm-side role
+ */
+export const isFirmRole = (role) => FIRM_ROLES.includes(role)
+
+/**
+ * Check if role is a client-side role
+ */
+export const isClientRole = (role) => CLIENT_ROLES.includes(role)
