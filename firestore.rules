@@ -77,7 +77,8 @@ service cloud.firestore {
         && profile(tenantId).get('clientOrgId', null) == orgId;
     }
 
-    // Clients who may update remediation status on their findings
+    // Clients (admin/technical) who may run AI analysis, use the chat and
+    // update remediation status on their findings. Client Viewers are read-only.
     function isClientRemediator(tenantId, orgId) {
       return isClientOf(tenantId, orgId)
         && profile(tenantId).get('role', '') in ['CLIENT_ADMIN', 'CLIENT_TECHNICAL'];
@@ -87,10 +88,35 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/tenants/$(tenantId)/reports/$(reportId)).data.get('clientOrgId', null);
     }
 
-    // Fields anyone allowed to work a finding may change (status workflow only)
-    function onlyRemediationFieldsChanged() {
+    // Report fields a client's AI run may write (scores only, never ownership/sharing)
+    function onlyAnalysisFieldsChanged() {
       return request.resource.data.diff(resource.data).affectedKeys()
-        .hasOnly(['remediationStatus', 'assignedTo', 'remediationNote', 'dueDate', 'updatedAt', 'updatedBy', 'statusHistory']);
+        .hasOnly(['riskScore', 'riskLevel', 'totalFindings', 'severityBreakdown', 'status', 'analyzedAt']);
+    }
+
+    // --- Remediation workflow ---------------------------------------------
+    // Client (admin/technical): work the fix -> in_progress, remediated (fix submitted
+    //   for retest) or risk_accepted. Cannot touch a finding the firm has verified.
+    // Firm (admin/analyst): only retests -> verified or not_fixed, and only once the
+    //   client has submitted a fix (or to reopen a verified one).
+    function oldStatus() {
+      return resource.data.get('remediationStatus', 'open');
+    }
+    function newStatus() {
+      return request.resource.data.get('remediationStatus', 'open');
+    }
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+    function isClientRemediationUpdate() {
+      return changedKeys().hasOnly(['remediationStatus', 'assignedTo', 'remediationNote', 'dueDate', 'updatedAt', 'updatedBy', 'statusHistory'])
+        && oldStatus() != 'verified'
+        && (newStatus() == oldStatus() || newStatus() in ['in_progress', 'remediated', 'risk_accepted']);
+    }
+    function isFirmVerificationUpdate() {
+      return changedKeys().hasOnly(['remediationStatus', 'verificationNote', 'verifiedBy', 'updatedAt', 'updatedBy', 'statusHistory'])
+        && oldStatus() in ['remediated', 'verified', 'not_fixed']
+        && newStatus() in ['verified', 'not_fixed'];
     }
 
     // --- userIndex writes by firm admins (inviting their own users) --------
@@ -128,23 +154,28 @@ service cloud.firestore {
       match /reports/{reportId} {
         allow read: if isSuperAdmin() || isFirmStaff(tenantId)
           || isClientOf(tenantId, resource.data.get('clientOrgId', null));
-        allow create, update: if isSuperAdmin() || isFirmStaff(tenantId);
+        allow create: if isSuperAdmin() || isFirmStaff(tenantId);
+        allow update: if isSuperAdmin() || isFirmStaff(tenantId)
+          || (isClientRemediator(tenantId, resource.data.get('clientOrgId', null)) && onlyAnalysisFieldsChanged());
         allow delete: if isSuperAdmin() || isFirmAdmin(tenantId);
 
         // Cached AI analysis
         match /analysis/{docId} {
           allow read: if isSuperAdmin() || isFirmStaff(tenantId)
             || isClientOf(tenantId, reportOrg(tenantId, reportId));
-          allow write: if isSuperAdmin() || isFirmStaff(tenantId);
+          allow write: if isSuperAdmin() || isFirmStaff(tenantId)
+            || isClientRemediator(tenantId, reportOrg(tenantId, reportId));
         }
 
-        // Findings: clients (admin/technical) may only move the remediation workflow
+        // Findings: created/replaced by AI analysis runs; status changes follow the workflow above
         match /findings/{findingId} {
           allow read: if isSuperAdmin() || isFirmStaff(tenantId)
             || isClientOf(tenantId, reportOrg(tenantId, reportId));
-          allow create, delete: if isSuperAdmin() || isFirmStaff(tenantId);
-          allow update: if isSuperAdmin() || isFirmStaff(tenantId)
-            || (isClientRemediator(tenantId, reportOrg(tenantId, reportId)) && onlyRemediationFieldsChanged());
+          allow create, delete: if isSuperAdmin() || isFirmStaff(tenantId)
+            || isClientRemediator(tenantId, reportOrg(tenantId, reportId));
+          allow update: if isSuperAdmin()
+            || (isFirmStaff(tenantId) && isFirmVerificationUpdate())
+            || (isClientRemediator(tenantId, reportOrg(tenantId, reportId)) && isClientRemediationUpdate());
         }
       }
 

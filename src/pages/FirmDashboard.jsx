@@ -35,8 +35,9 @@ const AXIS_TICK = { fill: '#8892A4', fontSize: 12 }
 
 function statusBucket(f) {
   const s = f.remediationStatus || 'open'
-  if (s === 'remediated' || s === 'risk_accepted') return 'closed'
-  if (s === 'in_progress') return 'in_progress'
+  if (s === 'verified' || s === 'risk_accepted') return 'closed'
+  // client is working on it, or has submitted a fix the firm still has to retest
+  if (s === 'in_progress' || s === 'remediated') return 'in_progress'
   return 'open'
 }
 

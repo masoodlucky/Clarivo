@@ -140,7 +140,7 @@ export default function TopNav({ sidebarCollapsed, onToggleSidebar }) {
                 </p>
               </div>
               <button
-                onClick={() => { setShowUserMenu(false); navigate('/admin'); }}
+                onClick={() => { setShowUserMenu(false); navigate('/profile'); }}
                 className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer"
                 style={{ color: 'var(--color-text-secondary)', background: 'transparent', border: 'none', textAlign: 'left' }}
               >

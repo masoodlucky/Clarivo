@@ -7,7 +7,7 @@ import Card from '../components/ui/Card'
 import Badge from '../components/ui/Badge'
 import { BarChart3, Shield, FileText, CheckCircle, Clock, Loader, ChevronRight, AlertTriangle } from 'lucide-react'
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip } from 'recharts'
-import { loadVisibleReports, loadFindingsForReports, summarizeRemediation, SEVERITY_ORDER } from '../services/reportData'
+import { loadVisibleReports, loadFindingsForReports, summarizeRemediation, isClosedFinding, SEVERITY_ORDER } from '../services/reportData'
 import { calculateRiskScore } from '../services/llmService'
 
 function riskBand(score) {
@@ -69,12 +69,12 @@ export default function ClientDashboard() {
 
   const summary = useMemo(() => summarizeRemediation(findings), [findings])
   const openFindings = useMemo(
-    () => findings.filter(f => ['open', 'in_progress', undefined].includes(f.remediationStatus)),
+    () => findings.filter(f => !isClosedFinding(f)),
     [findings])
   // Current risk = risk of what is still unfixed, so the score drops as findings are remediated
   const currentRisk = calculateRiskScore(openFindings)
   const band = riskBand(currentRisk)
-  const closed = summary.remediated + summary.risk_accepted
+  const closed = summary.closed
   const progressPct = summary.total ? Math.round((closed / summary.total) * 100) : 0
 
   const openBySeverity = SEVERITY_ORDER.map(s => ({ s, n: openFindings.filter(f => f.severity === s).length })).filter(x => x.n > 0)
@@ -150,9 +150,9 @@ export default function ClientDashboard() {
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {[
               { icon: FileText, label: 'Reports Received', value: reports.length, color: 'var(--color-primary)' },
-              { icon: Shield, label: 'Open Findings', value: summary.open, color: 'var(--color-danger)' },
-              { icon: Clock, label: 'In Progress', value: summary.in_progress, color: 'var(--color-warning)' },
-              { icon: CheckCircle, label: 'Remediated', value: summary.remediated, color: 'var(--color-success)' },
+              { icon: Shield, label: 'Open / Reopened', value: summary.unfixed, color: 'var(--color-danger)' },
+              { icon: Clock, label: 'In Progress / Awaiting Retest', value: summary.in_progress + summary.remediated, color: 'var(--color-warning)' },
+              { icon: CheckCircle, label: 'Verified Fixed', value: summary.verified, color: 'var(--color-success)' },
             ].map((s) => {
               const Icon = s.icon
               return (
@@ -209,7 +209,7 @@ export default function ClientDashboard() {
               <div className="space-y-2">
                 {reports.map(r => {
                   const rf = findings.filter(f => f.reportId === r.id)
-                  const rClosed = rf.filter(f => ['remediated', 'risk_accepted'].includes(f.remediationStatus)).length
+                  const rClosed = rf.filter(isClosedFinding).length
                   return (
                     <button key={r.id} onClick={() => navigate(`/reports/${r.id}`)}
                       className="w-full flex items-center justify-between p-3 rounded-lg text-left cursor-pointer"

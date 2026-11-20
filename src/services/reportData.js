@@ -12,12 +12,34 @@ import {
 import { db } from '../config/firebase'
 import { isClientRole } from '../config/roles'
 
+/**
+ * Remediation workflow (enforced by Firestore rules too):
+ *   Client (admin/technical):  open / not_fixed -> in_progress -> remediated ("fix submitted"), or risk_accepted
+ *   Firm (admin/analyst):      remediated -> verified (retest passed) or not_fixed (retest failed, note required)
+ *   Client Viewer:             read only
+ */
 export const REMEDIATION_STATUSES = [
   { value: 'open', label: 'Open' },
   { value: 'in_progress', label: 'In Progress' },
-  { value: 'remediated', label: 'Remediated' },
+  { value: 'remediated', label: 'Fixed – Pending Verification' },
+  { value: 'not_fixed', label: 'Not Fixed – Reopened' },
+  { value: 'verified', label: 'Verified Fixed' },
   { value: 'risk_accepted', label: 'Risk Accepted' },
 ]
+
+/** Statuses a client may set */
+export const CLIENT_STATUSES = ['in_progress', 'remediated', 'risk_accepted']
+/** Statuses that count as closed (no remaining risk) */
+export const CLOSED_STATUSES = ['verified', 'risk_accepted']
+/** Statuses where the firm may retest (verify or reopen) */
+export const FIRM_REVIEWABLE = ['remediated', 'verified', 'not_fixed']
+
+export const statusOf = (f) => f?.remediationStatus || 'open'
+export const isClosedFinding = (f) => CLOSED_STATUSES.includes(statusOf(f))
+export const statusLabel = (v) => REMEDIATION_STATUSES.find(s => s.value === v)?.label || v
+
+/** Key used to carry remediation state across AI re-analysis */
+export const findingKey = (f) => String(f?.findingRef || f?.title || '').trim().toLowerCase()
 
 export const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info']
 
@@ -56,7 +78,7 @@ export async function loadFindingsForReports(tenantId, reports) {
 }
 
 /** Update a finding's remediation workflow fields and append to its history. */
-export async function updateFindingRemediation(tenantId, finding, changes, userEmail) {
+export async function updateFindingRemediation(tenantId, finding, changes, userEmail, note) {
   const ref = doc(db, 'tenants', tenantId, 'reports', finding.reportId, 'findings', finding.id)
   const update = { ...changes, updatedAt: serverTimestamp(), updatedBy: userEmail || null }
   if (changes.remediationStatus && changes.remediationStatus !== finding.remediationStatus) {
@@ -64,6 +86,7 @@ export async function updateFindingRemediation(tenantId, finding, changes, userE
       from: finding.remediationStatus || 'open',
       to: changes.remediationStatus,
       by: userEmail || null,
+      note: note || null,
       at: new Date().toISOString(),
     })
   }
@@ -72,10 +95,12 @@ export async function updateFindingRemediation(tenantId, finding, changes, userE
 
 /** Counts by remediation status. */
 export function summarizeRemediation(findings) {
-  const s = { open: 0, in_progress: 0, remediated: 0, risk_accepted: 0, total: findings.length }
+  const s = { open: 0, in_progress: 0, remediated: 0, not_fixed: 0, verified: 0, risk_accepted: 0, total: findings.length }
   findings.forEach(f => {
-    const k = f.remediationStatus || 'open'
+    const k = statusOf(f)
     s[k] = (s[k] || 0) + 1
   })
+  s.closed = s.verified + s.risk_accepted
+  s.unfixed = s.open + s.not_fixed
   return s
 }

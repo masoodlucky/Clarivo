@@ -12,6 +12,9 @@ import {
   Users,
   Server,
   ClipboardList,
+  Bug,
+  UserCircle,
+  ShieldCheck,
   ChevronLeft,
   ChevronRight,
   Zap,
@@ -35,7 +38,9 @@ const navItems = [
   {
     section: 'Operations',
     items: [
+      { label: 'Findings', path: '/findings', icon: Bug },
       { label: 'Remediation', path: '/remediation', icon: ClipboardList },
+      { label: 'Compliance', path: '/compliance', icon: ShieldCheck },
       { label: 'Audit Log', path: '/audit-log', icon: Shield, permission: 'VIEW_AUDIT_LOGS' },
       { label: 'Notifications', path: '/notifications', icon: Bell },
     ],
@@ -45,6 +50,12 @@ const navItems = [
     items: [
       { label: 'Deployment Health', path: '/deployment-health', icon: Server, permission: 'VIEW_DEPLOYMENT_HEALTH' },
       { label: 'Admin Panel', path: '/admin', icon: Settings, permission: 'MANAGE_FIRM_USERS' },
+    ],
+  },
+  {
+    section: 'Settings',
+    items: [
+      { label: 'My Profile', path: '/profile', icon: UserCircle },
     ],
   },
 ]

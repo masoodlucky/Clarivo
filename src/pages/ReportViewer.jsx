@@ -68,6 +68,7 @@ function ElapsedTime({ since }) {
 }
 import { extractTextFromPdfUrl } from '../services/pdfExtractor'
 import { resolveReportFileUrl } from '../services/fileStorage'
+import { findingKey, isClosedFinding } from '../services/reportData'
 import { canDo, ROLES, isFirmRole } from '../config/roles'
 import { collection as fsCollection, getDocs as fsGetDocs } from 'firebase/firestore'
 import Card from '../components/ui/Card'
@@ -204,7 +205,7 @@ function RenderMarkdown({ text }) {
 
 // ─── Chat Sidebar ──────────────────────────────────────────
 
-function ChatSidebar({ report, analysis, extractedText }) {
+function ChatSidebar({ report, analysis, extractedText, canAsk = true }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
@@ -263,6 +264,19 @@ function ChatSidebar({ report, analysis, extractedText }) {
     } finally {
       setSending(false)
     }
+  }
+
+  if (!canAsk) {
+    return (
+      <div className="rounded-xl p-5 text-center"
+        style={{ background: 'var(--color-bg-surface)', border: '1px solid var(--color-border)' }}>
+        <Lock size={20} className="mx-auto mb-2" style={{ color: 'var(--color-text-muted)' }} />
+        <p className="text-sm font-semibold" style={{ color: 'var(--color-text-primary)' }}>AI chat not available for your role</p>
+        <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+          Client Viewers can read the analysis. Ask your Client Admin or Technical contact to query the AI.
+        </p>
+      </div>
+    )
   }
 
   return (
@@ -371,8 +385,10 @@ export default function ReportViewer() {
   const { reportId } = useParams()
   const navigate = useNavigate()
   const { role, tenantId } = useAuth()
-  // Only firm staff can run/re-run AI or re-link reports (Firestore rules enforce the same)
+  // Only firm staff can re-link reports; AI analysis + chat for every role except Client Viewer
+  // (Firestore rules enforce the same)
   const isFirmUser = isFirmRole(role)
+  const canUseAI = canDo('USE_AI', role)
 
   const [report, setReport] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -476,16 +492,19 @@ export default function ReportViewer() {
     }
   }
 
-  async function handleExplain() {
-    if (analysis) { setMode('explain'); return }
-    setMode('explain')
+  // Run the AI pipeline and save the result. Shared by "Explain with AI" and "Re-analyze".
+  // Existing findings are replaced, but their remediation workflow (status, assignee,
+  // notes, history) is carried over by finding reference, so a re-run never wipes
+  // the client's or firm's progress. Each write step is labelled so a permission
+  // error says exactly which save was refused.
+  async function runAnalysis({ forceExtract }) {
     setAnalyzing(true)
     setAnalysisSteps(null)
     setAnalysisStartedAt(null)
     setAnalysisError('')
+    let step = 'reading the report file'
     try {
-      // Step 0: Extract actual PDF text FIRST
-      let pdfText = extractedText
+      let pdfText = forceExtract ? '' : extractedText
       if (!pdfText && report.fileType === 'application/pdf') {
         try {
           const freshUrl = await resolveReportFileUrl(report)
@@ -498,157 +517,94 @@ export default function ReportViewer() {
         }
       }
 
-      // Run the full 3-step pipeline
+      step = 'running the AI analysis'
       const result = await analyzeReport(report, onAnalysisProgress, pdfText)
-
-      // Save each finding to the findings subcollection
       const findings = result.findings || []
+
+      step = 'reading existing findings'
+      const findingsCol = collection(db, 'tenants', tenantId, 'reports', reportId, 'findings')
+      const existing = await getDocs(findingsCol)
+      const carried = new Map()
+      existing.docs.forEach(d => {
+        const f = d.data()
+        const key = findingKey(f)
+        if (key && !carried.has(key)) {
+          carried.set(key, {
+            remediationStatus: f.remediationStatus || 'open',
+            assignedTo: f.assignedTo || null,
+            remediationNote: f.remediationNote || null,
+            verificationNote: f.verificationNote || null,
+            verifiedBy: f.verifiedBy || null,
+            statusHistory: f.statusHistory || [],
+          })
+        }
+      })
+
+      step = 'removing the previous findings'
+      for (const d of existing.docs) await deleteDoc(d.ref)
+
+      step = 'saving the new findings'
+      const saved = []
       for (const finding of findings) {
-        const findingId = finding.id || ('finding-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8))
-        await setDoc(
-          doc(db, 'tenants', tenantId, 'reports', reportId, 'findings', findingId),
-          {
-            ...finding,
-            id: findingId,
-            remediationStatus: finding.remediationStatus || 'open',
-            assignedTo: finding.assignedTo || null,
-            createdAt: serverTimestamp(),
-          }
-        )
+        const findingId = 'finding-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8)
+        const prev = carried.get(findingKey(finding)) || {}
+        const data = {
+          ...finding,
+          id: findingId,
+          remediationStatus: prev.remediationStatus || 'open',
+          assignedTo: prev.assignedTo || null,
+          remediationNote: prev.remediationNote || null,
+          verificationNote: prev.verificationNote || null,
+          verifiedBy: prev.verifiedBy || null,
+          statusHistory: prev.statusHistory || [],
+          createdAt: serverTimestamp(),
+        }
+        await setDoc(doc(findingsCol, findingId), data)
+        saved.push(data)
       }
 
-      // Update the report document with risk score and severity
+      step = 'updating the report risk score'
       const riskScore = result.riskScore || calculateRiskScore(findings)
       const severityBreakdown = result.severityBreakdown || buildSeverityBreakdown(findings)
       const riskLevel = result.riskLevel || 'low'
-
       await updateDoc(doc(db, 'tenants', tenantId, 'reports', reportId), {
-        riskScore: riskScore,
-        riskLevel: riskLevel,
-        totalFindings: findings.length,
-        severityBreakdown: severityBreakdown,
-        status: 'analyzed',
-        analyzedAt: serverTimestamp(),
-      })
-
-      // Update local report state
-      setReport(prev => ({
-        ...prev,
         riskScore, riskLevel,
         totalFindings: findings.length,
         severityBreakdown,
         status: 'analyzed',
-      }))
+        analyzedAt: serverTimestamp(),
+      })
+      setReport(prev => ({ ...prev, riskScore, riskLevel, totalFindings: findings.length, severityBreakdown, status: 'analyzed' }))
 
-      // Cache the analysis to analysis/ai
-      setAnalysis(result)
-      try {
-        await setDoc(doc(db, 'tenants', tenantId, 'reports', reportId, 'analysis', 'ai'), {
-          ...result,
-          extractedText: pdfText || '',
-          cachedAt: new Date().toISOString(),
-        })
-      } catch (e) { console.warn('Analysis cache failed:', e) }
-
+      step = 'saving the analysis'
+      const finalResult = { ...result, findings: saved.length ? saved : findings }
+      await setDoc(doc(db, 'tenants', tenantId, 'reports', reportId, 'analysis', 'ai'), {
+        ...finalResult,
+        extractedText: pdfText || '',
+        cachedAt: new Date().toISOString(),
+      })
+      setAnalysis(finalResult)
+      console.log('[Clarivo] Analysis saved: ' + findings.length + ' findings, riskScore=' + riskScore)
     } catch (err) {
-      console.error('Analysis failed:', err)
-      setAnalysisError(err.message || 'AI analysis failed.')
+      console.error('Analysis failed while ' + step + ':', err)
+      const denied = err?.code === 'permission-denied' || /insufficient permissions/i.test(err?.message || '')
+      setAnalysisError(denied
+        ? `Permission denied while ${step}. Make sure the latest firestore.rules are published in the Firebase Console, then try again.`
+        : (err.message || 'AI analysis failed.'))
     } finally {
       setAnalyzing(false)
     }
   }
 
+  async function handleExplain() {
+    setMode('explain')
+    if (analysis) return
+    await runAnalysis({ forceExtract: false })
+  }
+
   async function handleReAnalyze() {
     setAnalysis(null)
-    setAnalyzing(true)
-    setAnalysisSteps(null)
-    setAnalysisStartedAt(null)
-    setAnalysisError('')
-    try {
-      // Step 1: Delete all existing findings from subcollection
-      console.log('[Clarivo] Deleting existing findings...')
-      const existingFindings = await getDocs(
-        collection(db, 'tenants', tenantId, 'reports', reportId, 'findings')
-      )
-      for (const findingDoc of existingFindings.docs) {
-        await deleteDoc(doc(db, 'tenants', tenantId, 'reports', reportId, 'findings', findingDoc.id))
-      }
-
-      // Step 2: Delete the analysis cache
-      try {
-        await deleteDoc(doc(db, 'tenants', tenantId, 'reports', reportId, 'analysis', 'ai'))
-      } catch (e) { console.warn('Old analysis cache delete failed:', e) }
-
-      // Step 3: Re-extract PDF text
-      let pdfText = ''
-      if (report.fileType === 'application/pdf') {
-        try {
-          const freshUrl = await resolveReportFileUrl(report)
-          if (!freshUrl) throw new Error('No stored file for this report')
-          pdfText = await extractTextFromPdfUrl(freshUrl)
-          setExtractedText(pdfText)
-        } catch (extractErr) {
-          console.warn('[Clarivo] PDF text extraction failed:', extractErr.message)
-        }
-      }
-
-      // Step 4: Run the full 3-step pipeline again
-      const result = await analyzeReport(report, onAnalysisProgress, pdfText)
-
-      // Step 5: Save each finding to subcollection
-      const findings = result.findings || []
-      for (const finding of findings) {
-        const findingId = finding.id || ('finding-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8))
-        await setDoc(
-          doc(db, 'tenants', tenantId, 'reports', reportId, 'findings', findingId),
-          {
-            ...finding,
-            id: findingId,
-            remediationStatus: finding.remediationStatus || 'open',
-            assignedTo: finding.assignedTo || null,
-            createdAt: serverTimestamp(),
-          }
-        )
-      }
-
-      // Step 6: Update the report document with risk score
-      const riskScore = result.riskScore || calculateRiskScore(findings)
-      const severityBreakdown = result.severityBreakdown || buildSeverityBreakdown(findings)
-      const riskLevel = result.riskLevel || 'low'
-
-      await updateDoc(doc(db, 'tenants', tenantId, 'reports', reportId), {
-        riskScore: riskScore,
-        riskLevel: riskLevel,
-        totalFindings: findings.length,
-        severityBreakdown: severityBreakdown,
-        status: 'analyzed',
-        analyzedAt: serverTimestamp(),
-      })
-
-      // Update local report state
-      setReport(prev => ({
-        ...prev,
-        riskScore, riskLevel,
-        totalFindings: findings.length,
-        severityBreakdown,
-        status: 'analyzed',
-      }))
-
-      // Step 7: Cache the analysis
-      setAnalysis(result)
-      await setDoc(doc(db, 'tenants', tenantId, 'reports', reportId, 'analysis', 'ai'), {
-        ...result,
-        extractedText: pdfText || '',
-        cachedAt: new Date().toISOString(),
-      })
-
-      console.log('[Clarivo] Re-analysis complete: ' + findings.length + ' findings, riskScore=' + riskScore)
-    } catch (err) {
-      console.error('Re-analysis failed:', err)
-      setAnalysisError(err.message || 'AI analysis failed.')
-    } finally {
-      setAnalyzing(false)
-    }
+    await runAnalysis({ forceExtract: true })
   }
 
   // ─── Loading / Not Found ─────────────────────────────────
@@ -703,7 +659,7 @@ export default function ReportViewer() {
               style={{ background: 'var(--color-bg-surface)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', textDecoration: 'none' }}>
               <Download size={16} /> Download
             </a>
-            {(analysis || isFirmUser) && (
+            {(analysis || canUseAI) && (
               <Button icon={Sparkles} onClick={handleExplain}>
                 {analysis ? 'View AI Analysis' : 'Explain with AI'}
               </Button>
@@ -798,7 +754,7 @@ export default function ReportViewer() {
               </p>
             </div>
           </div>
-          {(analysis || isFirmUser) ? (
+          {(analysis || canUseAI) ? (
             <Button icon={Sparkles} onClick={handleExplain}>{analysis ? 'View Analysis' : 'Explain with AI'}</Button>
           ) : (
             <span className="text-xs" style={{ color: 'var(--color-text-muted)' }}>Analysis not available yet</span>
@@ -911,7 +867,7 @@ export default function ReportViewer() {
           <p className="text-sm max-w-md text-center" style={{ color: 'var(--color-text-secondary)' }}>{analysisError}</p>
           <div className="flex gap-3">
             <Button variant="secondary" icon={ArrowLeft} onClick={() => setMode('view')}>Back to PDF</Button>
-            {isFirmUser && <Button icon={RefreshCw} onClick={handleReAnalyze}>Try Again</Button>}
+            {canUseAI && <Button icon={RefreshCw} onClick={handleReAnalyze}>Try Again</Button>}
           </div>
         </div>
       </div>
@@ -959,7 +915,7 @@ export default function ReportViewer() {
 
         <div className="flex items-center gap-2 flex-wrap">
           <Button variant="secondary" icon={Eye} onClick={() => setMode('view')}>View PDF</Button>
-          {isFirmUser && <Button variant="secondary" icon={RefreshCw} onClick={handleReAnalyze}>Re-analyze</Button>}
+          {canUseAI && <Button variant="secondary" icon={RefreshCw} onClick={handleReAnalyze}>Re-analyze</Button>}
           <div className="inline-flex rounded-lg p-1"
             style={{ background: 'var(--color-bg-container-lowest)', border: '1px solid var(--color-border)' }}>
             <button onClick={() => handleToggle('executive')}
@@ -1274,12 +1230,12 @@ export default function ReportViewer() {
                       <div className="flex justify-between text-sm mb-2">
                         <span style={{ color: 'var(--color-text-secondary)' }}>Overall Progress</span>
                         <span className="font-semibold" style={{ color: 'var(--color-primary)' }}>
-                          {findings.filter(f => f.remediationStatus === 'remediated').length}/{findings.length} resolved
+                          {findings.filter(isClosedFinding).length}/{findings.length} verified fixed
                         </span>
                       </div>
                       <div className="h-2 rounded-full" style={{ background: 'var(--color-bg-container-lowest)' }}>
                         <div className="h-full rounded-full" style={{
-                          width: `${findings.length ? (findings.filter(f => f.remediationStatus === 'remediated').length / findings.length) * 100 : 0}%`,
+                          width: `${findings.length ? (findings.filter(isClosedFinding).length / findings.length) * 100 : 0}%`,
                           background: 'linear-gradient(90deg, var(--color-primary), var(--color-success))'
                         }} />
                       </div>
@@ -1358,7 +1314,7 @@ export default function ReportViewer() {
         {/* Right — Chat Sidebar (32%) */}
         <div className="hidden lg:block" style={{ width: '32%', minWidth: 320, maxWidth: 420 }}>
           <div className="sticky top-5">
-            <ChatSidebar report={report} analysis={analysis} extractedText={extractedText} />
+            <ChatSidebar report={report} analysis={analysis} extractedText={extractedText} canAsk={canUseAI} />
           </div>
         </div>
       </div>
@@ -1373,7 +1329,7 @@ export default function ReportViewer() {
       </div>
       {chatOpen && (
         <div className="lg:hidden fixed inset-x-4 bottom-24 z-50 shadow-2xl rounded-xl" style={{ height: 400 }}>
-          <ChatSidebar report={report} analysis={analysis} extractedText={extractedText} />
+          <ChatSidebar report={report} analysis={analysis} extractedText={extractedText} canAsk={canUseAI} />
         </div>
       )}
 

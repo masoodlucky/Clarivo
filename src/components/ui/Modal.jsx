@@ -1,5 +1,6 @@
 import { X } from 'lucide-react'
 import { useEffect } from 'react'
+import { createPortal } from 'react-dom'
 
 export default function Modal({ isOpen, onClose, title, children, size = 'md', className = '' }) {
   useEffect(() => {
@@ -20,16 +21,17 @@ export default function Modal({ isOpen, onClose, title, children, size = 'md', c
     xl: 'max-w-4xl',
   }
 
-  return (
+  // Portal to <body> so a transformed/animated page wrapper cannot trap the fixed overlay
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="fixed inset-0 z-[100] flex items-center justify-center p-4"
       onClick={onClose}
     >
       {/* Backdrop */}
       <div className="absolute inset-0" style={{ background: 'rgba(0, 0, 0, 0.6)', backdropFilter: 'blur(4px)' }} />
       {/* Content */}
       <div
-        className={`relative w-full ${sizes[size]} rounded-xl animate-fade-in ${className}`}
+        className={`relative w-full ${sizes[size]} max-h-[90vh] overflow-y-auto rounded-xl animate-fade-in ${className}`}
         style={{
           background: 'var(--color-bg-container-high)',
           border: '1px solid var(--color-border)',
@@ -53,6 +55,7 @@ export default function Modal({ isOpen, onClose, title, children, size = 'md', c
         {/* Body */}
         <div className="px-6 py-5">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body
   )
 }

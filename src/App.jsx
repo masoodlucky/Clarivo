@@ -19,6 +19,9 @@ import ReportViewer from './pages/ReportViewer'
 import ReportsList from './pages/ReportsList'
 import RemediationTracker from './pages/RemediationTracker'
 import AuditLog from './pages/AuditLog'
+import FindingsExplorer from './pages/FindingsExplorer'
+import ComplianceView from './pages/ComplianceView'
+import Profile from './pages/Profile'
 import DeploymentHealth from './pages/DeploymentHealth'
 import AdminPanel from './pages/AdminPanel'
 import NotificationCenter from './pages/NotificationCenter'
@@ -67,6 +70,15 @@ function AuthenticatedApp() {
         {/* Operations */}
         <Route path="/remediation" element={
           <TenantRoute><RemediationTracker /></TenantRoute>
+        } />
+        <Route path="/profile" element={
+          <TenantRoute><Profile /></TenantRoute>
+        } />
+        <Route path="/findings" element={
+          <TenantRoute><FindingsExplorer /></TenantRoute>
+        } />
+        <Route path="/compliance" element={
+          <TenantRoute><ComplianceView /></TenantRoute>
         } />
         <Route path="/audit-log" element={
           <TenantRoute permission="VIEW_AUDIT_LOGS"><AuditLog /></TenantRoute>

@@ -23,6 +23,7 @@ import { ROLES, ROLE_LABELS, isFirmRole } from '../config/roles'
 import Card from '../components/ui/Card'
 import Button from '../components/ui/Button'
 import Input from '../components/ui/Input'
+import Modal from '../components/ui/Modal'
 import {
   Users,
   Building,
@@ -76,6 +77,11 @@ function slugify(s) {
 
 export default function AdminPanel() {
   const { profile, tenantId } = useAuth()
+
+  // Edit user (role / client org) — firm admin only
+  const [editUser, setEditUser] = useState(null) // { user, role, clientOrgId }
+  const [editSaving, setEditSaving] = useState(false)
+  const [editError, setEditError] = useState('')
 
   // Users list
   const [users, setUsers] = useState([])
@@ -313,6 +319,38 @@ export default function AdminPanel() {
 
   const isClientRole = (role) => !isFirmRole(role)
 
+  function openEditUser(u) {
+    setEditError('')
+    setEditUser({ user: u, role: u.role, clientOrgId: u.clientOrgId || '' })
+  }
+
+  async function handleSaveUser() {
+    const { user, role, clientOrgId } = editUser
+    if (isClientRole(role) && !clientOrgId) {
+      setEditError('Client users must be linked to a client organisation.')
+      return
+    }
+    setEditSaving(true)
+    setEditError('')
+    try {
+      await updateDoc(doc(db, 'tenants', tenantId, 'users', user.id), {
+        role,
+        clientOrgId: isClientRole(role) ? clientOrgId : null,
+        updatedAt: serverTimestamp(),
+        updatedBy: profile?.email || null,
+      })
+      setEditUser(null)
+      await loadUsers()
+    } catch (err) {
+      console.error('Update user failed:', err)
+      setEditError(err?.code === 'permission-denied'
+        ? 'Permission denied. Only the Firm Admin can change roles.'
+        : 'Could not save: ' + err.message)
+    } finally {
+      setEditSaving(false)
+    }
+  }
+
   // Invite form helpers: duplicate email warning + org suggested by email domain
   const inviteEmailNorm = inviteEmail.trim().toLowerCase()
   const existingInviteUser = inviteEmailNorm
@@ -542,7 +580,7 @@ export default function AdminPanel() {
                         </span>
                       </td>
                       <td className="px-3 py-3 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-                        {u.clientOrgId || '—'}
+                        {u.clientOrgId ? (clientOrgs.find(o => o.id === u.clientOrgId)?.name || u.clientOrgId) : '—'}
                       </td>
                       <td className="px-3 py-3">
                         <span style={{ color: u.mfaEnabled ? 'var(--color-success)' : 'var(--color-text-muted)' }}>
@@ -563,6 +601,16 @@ export default function AdminPanel() {
                       </td>
                       <td className="px-3 py-3">
                         <div className="flex gap-1">
+                          {u.id !== profile?.uid && u.role !== ROLES.FIRM_ADMIN && (
+                            <button
+                              onClick={() => openEditUser(u)}
+                              className="p-1.5 rounded cursor-pointer text-xs flex items-center gap-1"
+                              style={{ color: 'var(--color-primary)', background: 'transparent', border: 'none' }}
+                              title="Change role or organisation"
+                            >
+                              <Edit size={12} /> Edit
+                            </button>
+                          )}
                           <button
                             onClick={() => handleToggleActive(u.id, u.isActive)}
                             className="p-1.5 rounded cursor-pointer text-xs"
@@ -581,6 +629,70 @@ export default function AdminPanel() {
           </table>
         </div>
       </Card>
+
+      {/* ── Edit User Modal ── */}
+      <Modal isOpen={!!editUser} onClose={() => setEditUser(null)} title="Change role" size="sm">
+        {editUser && (() => {
+          const clientSide = isClientRole(editUser.user.role)
+          // Roles can change within the same side only: a client account never becomes firm staff
+          const options = INVITABLE_ROLES.filter(r => isClientRole(r) === clientSide)
+          const selectStyle = {
+            background: 'var(--color-bg-container)',
+            color: 'var(--color-text-primary)',
+            border: '1px solid var(--color-border)',
+          }
+          return (
+            <div className="space-y-4">
+              <div>
+                <p className="text-sm font-semibold" style={{ color: 'var(--color-text-primary)' }}>
+                  {editUser.user.displayName || editUser.user.email}
+                </p>
+                <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>{editUser.user.email}</p>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider mb-2"
+                  style={{ color: 'var(--color-text-muted)', fontFamily: 'var(--font-label)' }}>Role</label>
+                <select value={editUser.role} onChange={e => setEditUser(prev => ({ ...prev, role: e.target.value }))}
+                  className="w-full px-3 py-2.5 rounded-lg text-sm" style={selectStyle}>
+                  {options.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+                </select>
+                {ROLE_HINTS[editUser.role] && (
+                  <p className="text-xs mt-1.5" style={{ color: 'var(--color-text-muted)' }}>{ROLE_HINTS[editUser.role]}</p>
+                )}
+                <p className="text-xs mt-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                  {clientSide
+                    ? 'Client accounts can switch between client roles only. To give someone firm access, invite them as an Analyst.'
+                    : 'Firm accounts stay firm roles.'}
+                </p>
+              </div>
+              {isClientRole(editUser.role) && (
+                <div>
+                  <label className="block text-xs font-semibold uppercase tracking-wider mb-2"
+                    style={{ color: 'var(--color-text-muted)', fontFamily: 'var(--font-label)' }}>Client Organisation</label>
+                  <select value={editUser.clientOrgId} onChange={e => setEditUser(prev => ({ ...prev, clientOrgId: e.target.value }))}
+                    className="w-full px-3 py-2.5 rounded-lg text-sm" style={selectStyle}>
+                    <option value="">Select organisation...</option>
+                    {clientOrgs.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}
+                  </select>
+                </div>
+              )}
+              {editError && (
+                <p className="text-sm" style={{ color: 'var(--color-danger)' }}>{editError}</p>
+              )}
+              <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                The change applies the next time they refresh or sign in.
+              </p>
+              <div className="flex justify-end gap-2">
+                <Button variant="ghost" onClick={() => setEditUser(null)}>Cancel</Button>
+                <Button onClick={handleSaveUser} loading={editSaving}
+                  disabled={editUser.role === editUser.user.role && (editUser.clientOrgId || '') === (editUser.user.clientOrgId || '')}>
+                  Save changes
+                </Button>
+              </div>
+            </div>
+          )
+        })()}
+      </Modal>
 
       {/* ── Invite User Modal ── */}
       {showInvite && (
