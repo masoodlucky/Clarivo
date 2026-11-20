@@ -1,6 +1,7 @@
 import { Navigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { Loader2 } from 'lucide-react'
+import { canDo } from '../config/roles'
 
 // ─── 1. Tenant Route (Normal App Users) ─────────────────────
 // Protects /dashboard/*, /reports/*, etc.
@@ -37,7 +38,10 @@ export function TenantRoute({ children, allowedRoles, permission }) {
     return <Navigate to="/unauthorized" replace />
   }
 
-  // (Optional) permission-based checks could go here too if you expand the schema
+  // Permission-based access (e.g. UPLOAD_REPORT, MANAGE_FIRM_USERS)
+  if (permission && !canDo(permission, profile.role)) {
+    return <Navigate to="/unauthorized" replace />
+  }
 
   return children
 }

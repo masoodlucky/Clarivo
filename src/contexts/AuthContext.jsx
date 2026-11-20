@@ -85,38 +85,47 @@ export function AuthProvider({ children }) {
     const indexRef = doc(db, 'userIndex', firebaseUser.uid)
     const indexSnap = await getDoc(indexRef)
 
-    if (!indexSnap.exists()) {
-      console.warn('No userIndex entry for', firebaseUser.uid)
-      setProfile(null)
-      setTenant(null)
-      return
+    let indexData = indexSnap.exists() ? indexSnap.data() : null
+
+    // If userIndex is missing or has no accountType, check /superAdmins/{uid} as fallback
+    // IMPORTANT: Always check superAdmins when accountType is missing, even if tenantId exists.
+    // A user might have been registered as a firm admin first and then bootstrapped as super admin.
+    if (!indexData || !indexData.accountType) {
+      const superRef = doc(db, 'superAdmins', firebaseUser.uid)
+      const superSnap = await getDoc(superRef)
+      if (superSnap.exists()) {
+        // Auto-heal: set/fix the userIndex entry to super_admin
+        const healedIndex = {
+          uid: firebaseUser.uid,
+          tenantId: null,
+          email: firebaseUser.email,
+          accountType: 'super_admin'
+        }
+        await setDoc(indexRef, healedIndex, { merge: true })
+        indexData = healedIndex
+      } else if (!indexData) {
+        console.warn('No userIndex entry for', firebaseUser.uid)
+        setProfile(null)
+        setTenant(null)
+        return
+      }
     }
 
-    const indexData = indexSnap.data()
-
-    // Step 2: Route Super Admin (Hardcoded failsafe + index check)
-    if (indexData.accountType === 'super_admin' || firebaseUser.email === 'masood@prudentbit.com') {
+    // Step 2: Route Super Admin (based on accountType)
+    if (indexData.accountType === 'super_admin') {
       const superRef = doc(db, 'superAdmins', firebaseUser.uid)
       const superSnap = await getDoc(superRef)
       
-      // If the super admin doc somehow doesn't exist, create it on the fly!
       if (!superSnap.exists()) {
+        // Self-heal: create the superAdmins profile if missing
         await setDoc(superRef, {
           email: firebaseUser.email,
-          displayName: 'Masood Aslam',
+          displayName: firebaseUser.displayName || firebaseUser.email,
           role: 'SUPER_ADMIN',
           isActive: true,
           createdAt: serverTimestamp(),
           lastLogin: serverTimestamp()
         })
-        
-        // Also fix their userIndex mapping immediately
-        await setDoc(indexRef, {
-          uid: firebaseUser.uid,
-          tenantId: null,
-          email: firebaseUser.email,
-          accountType: 'super_admin'
-        }, { merge: true })
       }
       
       const p = { 
@@ -125,12 +134,12 @@ export function AuthProvider({ children }) {
         accountType: 'super_admin' 
       }
       setProfile(p)
-      setTenant(null) // Super Admins are globally scoped, not boxed within a tenant
+      setTenant(null)
       setDoc(superRef, { lastLogin: serverTimestamp() }, { merge: true }).catch(() => {})
       return
     }
 
-    // Step 3: Route Tenant User (fallback default for older records as well)
+    // Step 3: Route Tenant User
     const tenantId = indexData.tenantId
     if (!tenantId) {
       setProfile(null)
@@ -265,6 +274,20 @@ export function AuthProvider({ children }) {
     }
   }
 
+  // ─── Force Profile Re-resolution ─────────────────────────
+  // Used by SuperAdminLogin after verifying credentials to ensure
+  // the profile is correctly resolved before navigating.
+
+  const forceResolveProfile = async () => {
+    const currentUser = auth.currentUser
+    if (!currentUser) return
+    try {
+      await resolveProfile(currentUser)
+    } catch (err) {
+      console.error('Force profile resolution failed:', err)
+    }
+  }
+
   // ─── Role-based Redirect Helper ──────────────────────────
 
   const getDefaultRoute = (role, accountType) => {
@@ -288,6 +311,7 @@ export function AuthProvider({ children }) {
     resetPassword,
     logout,
     getDefaultRoute,
+    forceResolveProfile,
     isAuthenticated: !!user && !!profile,
     role: profile?.role || null,
     tenantId: profile?.tenantId || tenant?.id || null,

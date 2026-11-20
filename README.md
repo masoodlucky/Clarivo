@@ -1,16 +1,14 @@
-# React + Vite
+# Clarivo
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+AI-powered VAPT report analysis platform. Firms upload penetration-test reports; Clarivo extracts every finding, scores risk, tracks remediation, and gives clients their own dashboard.
 
-Currently, two official plugins are available:
+## Stack
+React 19 + Vite, Tailwind, Firebase Auth/Firestore, Supabase Storage (report files, via the `report-files` Edge Function), Gemini 2.5 Flash or a local Ollama model for analysis.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Run locally
+1. `npm install`
+2. Create `.env` (never commit it) with the `VITE_FIREBASE_*`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_GEMINI_API_KEY` values.
+   Set `VITE_LLM_PROVIDER=gemini` (cloud) or `ollama` (on-prem, with `VITE_OLLAMA_MODEL`).
+3. `npm run dev`
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+Publish `firestore.rules` in the Firebase console, and deploy `supabase/functions/report-files` + run `supabase/setup.sql` in Supabase.

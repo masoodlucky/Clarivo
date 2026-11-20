@@ -4,6 +4,7 @@ const statusMap = {
   remediated:  { bg: 'rgba(0, 230, 118, 0.12)', color: '#00E676', label: 'Remediated' },
   verified:    { bg: 'rgba(0, 229, 255, 0.12)', color: '#00E5FF', label: 'Verified' },
   accepted:    { bg: 'rgba(136, 146, 164, 0.12)', color: '#8892A4', label: 'Risk Accepted' },
+  risk_accepted: { bg: 'rgba(136, 146, 164, 0.12)', color: '#8892A4', label: 'Risk Accepted' },
   reopened:    { bg: 'rgba(255, 77, 77, 0.12)', color: '#FF4D4D', label: 'Reopened' },
 }
 

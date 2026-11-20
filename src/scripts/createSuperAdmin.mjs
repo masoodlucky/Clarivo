@@ -34,8 +34,12 @@ const firebaseConfig = {
   appId: '1:17566530285:web:bede37c8773ca341c36ae4',
 }
 
-const SUPER_ADMIN_EMAIL = 'masood@prudentbit.com'
-const SUPER_ADMIN_PASSWORD = 'Admin@1234'
+const SUPER_ADMIN_EMAIL = process.env.SUPER_ADMIN_EMAIL
+const SUPER_ADMIN_PASSWORD = process.env.SUPER_ADMIN_PASSWORD
+if (!SUPER_ADMIN_EMAIL || !SUPER_ADMIN_PASSWORD) {
+  console.error('Set SUPER_ADMIN_EMAIL and SUPER_ADMIN_PASSWORD environment variables first.')
+  process.exit(1)
+}
 const SUPER_ADMIN_NAME = 'Masood Aslam'
 
 const app = initializeApp(firebaseConfig)
@@ -99,7 +103,7 @@ async function bootstrap() {
     console.log('\n━━━ ✅ Completely Clean Bootstrap! ━━━')
     console.log(`\n  Super Admin Login: http://localhost:5173/super-admin/login`)
     console.log(`  Email:             ${SUPER_ADMIN_EMAIL}`)
-    console.log(`  Password:          ${SUPER_ADMIN_PASSWORD}\n`)
+    console.log(`  Password:          (value of SUPER_ADMIN_PASSWORD)\n`)
 
     process.exit(0)
   } catch (err) {

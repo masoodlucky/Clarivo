@@ -275,7 +275,7 @@ export default function SuperAdminPanel() {
         title="Registered Firms"
         icon={CreditCard}
         subtitle="All tenant organisations on Clarivo"
-        headerAction={
+        headerRight={
           <Button variant="ghost" size="sm" icon={RefreshCw} onClick={loadFirms} loading={firmsLoading}>
             Refresh
           </Button>

@@ -68,9 +68,9 @@ export default function DeploymentHealth() {
           {getDeploymentLabel()}
         </h2>
         <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-          {isCloudMode()
-            ? 'Using Google Gemini 1.5 Pro via Vertex AI with Presidio PII scrubber'
-            : `Using ${ENV.ollamaModel} via Ollama · Zero data leaves your server`}
+          {llmInfo.provider === 'ollama'
+            ? `AI runs on ${llmInfo.backendModel} via Ollama at ${llmInfo.endpoint} · report text is not sent to an AI cloud`
+            : `AI runs on ${llmInfo.backendModel} via the Google Gemini API · report text is sent to Google for analysis`}
         </p>
       </div>
 

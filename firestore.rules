@@ -2,79 +2,155 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ─── Super Admins: read/write all access ───────────────
+    // --- Super Admins: read/write all access ---------------
     function isSuperAdmin() {
-      return request.auth != null 
+      return request.auth != null
         && exists(/databases/$(database)/documents/userIndex/$(request.auth.uid))
-        && get(/databases/$(database)/documents/userIndex/$(request.auth.uid)).data.accountType == 'super_admin';
+        && get(/databases/$(database)/documents/userIndex/$(request.auth.uid)).data.get('accountType', '') == 'super_admin';
     }
 
-    // ─── userIndex: readable by owner or super admin ─────
+    // --- userIndex: the source of truth for tenant membership --------
+    // Users must never be able to set their own tenantId or accountType, otherwise
+    // they could join any tenant or promote themselves to super admin. The only
+    // self-write allowed is the super-admin "auto-heal", and only for a uid that a
+    // super admin has already placed in /superAdmins.
+    function isSelfHealToSuperAdmin(uid) {
+      return request.auth != null
+        && request.auth.uid == uid
+        && exists(/databases/$(database)/documents/superAdmins/$(uid))
+        && request.resource.data.get('accountType', '') == 'super_admin'
+        && request.resource.data.get('tenantId', null) == null;
+    }
+
     match /userIndex/{uid} {
       allow read: if request.auth != null && (request.auth.uid == uid || isSuperAdmin());
-      // Writable by authenticated users (for self-registration or super admin)
-      allow create: if request.auth != null && (request.auth.uid == uid || isSuperAdmin());
-      allow update: if request.auth != null && (request.auth.uid == uid || isSuperAdmin());
+      allow create: if isSuperAdmin() || isSelfHealToSuperAdmin(uid) || isFirmAdminInvite();
+      allow update: if isSuperAdmin() || isSelfHealToSuperAdmin(uid);
       allow delete: if isSuperAdmin();
     }
 
     match /superAdmins/{uid} {
-      // Super admins can read themselves (no one else can read this collection safely from client)
-      allow read: if isSuperAdmin() && request.auth.uid == uid;
-      allow write: if request.auth != null && request.auth.uid == uid;
+      // Users may read only their own doc. Must not require isSuperAdmin(): AuthContext
+      // probes this doc for every user whose userIndex has no accountType (all tenant users),
+      // and a non-super-admin probe has to return "not found", not "permission denied".
+      allow read: if request.auth != null && request.auth.uid == uid;
+      // Only existing super admins can create/modify super admins. The first one is
+      // created by hand in the Firebase Console (see bootstrapSuperAdmin.mjs notes).
+      allow write: if isSuperAdmin();
     }
 
-    // ─── Tenant data: accessible by tenant users OR super admin ───
+    // --- Tenant helpers ------------------------------------------------
+    // Membership comes from /userIndex (only admins can write it); the role and
+    // client organisation come from the user's profile under the tenant.
+    function isTenantMember(tenantId) {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/userIndex/$(request.auth.uid))
+        && get(/databases/$(database)/documents/userIndex/$(request.auth.uid)).data.get('tenantId', '') == tenantId;
+    }
+
+    function profile(tenantId) {
+      return get(/databases/$(database)/documents/tenants/$(tenantId)/users/$(request.auth.uid)).data;
+    }
+
+    function hasProfile(tenantId) {
+      return exists(/databases/$(database)/documents/tenants/$(tenantId)/users/$(request.auth.uid));
+    }
+
+    function isActiveMember(tenantId) {
+      return isTenantMember(tenantId) && hasProfile(tenantId) && profile(tenantId).get('isActive', true) != false;
+    }
+
+    // Firm staff (admin + analysts) see and manage everything in their tenant
+    function isFirmStaff(tenantId) {
+      return isActiveMember(tenantId) && profile(tenantId).get('role', '') in ['FIRM_ADMIN', 'ANALYST'];
+    }
+
+    function isFirmAdmin(tenantId) {
+      return isActiveMember(tenantId) && profile(tenantId).get('role', '') == 'FIRM_ADMIN';
+    }
+
+    // Client users only see data for their own client organisation
+    function isClientOf(tenantId, orgId) {
+      return isActiveMember(tenantId)
+        && profile(tenantId).get('role', '') in ['CLIENT_ADMIN', 'CLIENT_VIEWER', 'CLIENT_TECHNICAL']
+        && orgId != null
+        && profile(tenantId).get('clientOrgId', null) == orgId;
+    }
+
+    // Clients who may update remediation status on their findings
+    function isClientRemediator(tenantId, orgId) {
+      return isClientOf(tenantId, orgId)
+        && profile(tenantId).get('role', '') in ['CLIENT_ADMIN', 'CLIENT_TECHNICAL'];
+    }
+
+    function reportOrg(tenantId, reportId) {
+      return get(/databases/$(database)/documents/tenants/$(tenantId)/reports/$(reportId)).data.get('clientOrgId', null);
+    }
+
+    // Fields anyone allowed to work a finding may change (status workflow only)
+    function onlyRemediationFieldsChanged() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly(['remediationStatus', 'assignedTo', 'remediationNote', 'dueDate', 'updatedAt', 'updatedBy', 'statusHistory']);
+    }
+
+    // --- userIndex writes by firm admins (inviting their own users) --------
+    // Kept separate from the /userIndex block above for readability.
+    function isFirmAdminInvite() {
+      return request.resource.data.get('accountType', '') == 'tenant_user'
+        && request.resource.data.get('tenantId', null) is string
+        && isFirmAdmin(request.resource.data.get('tenantId', ''));
+    }
+
+    // --- Tenants ---------------------------------------------------------
     match /tenants/{tenantId} {
-      allow read: if request.auth != null
-        && (isSuperAdmin() || (
-            exists(/databases/$(database)/documents/userIndex/$(request.auth.uid))
-            && get(/databases/$(database)/documents/userIndex/$(request.auth.uid)).data.tenantId == tenantId
-        ));
-      
-      // Allow create for new firm registration OR super admin
-      allow create: if request.auth != null && (isSuperAdmin() || !isSuperAdmin()); 
-      
-      allow update: if request.auth != null
-        && (isSuperAdmin() || (
-            exists(/databases/$(database)/documents/userIndex/$(request.auth.uid))
-            && get(/databases/$(database)/documents/userIndex/$(request.auth.uid)).data.tenantId == tenantId
-        ));
-      
-      allow delete: if false; // Soft deletes via isActive for tenants
+      allow read: if isSuperAdmin() || isTenantMember(tenantId);
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin() || isFirmAdmin(tenantId);
+      allow delete: if false; // soft delete via isActive
 
-      // Sub-collections (users, reports, findings, xaiResults, dashboardStats)
-      match /{subcollection}/{docId} {
-        allow read: if request.auth != null
-          && (isSuperAdmin() || (
-              exists(/databases/$(database)/documents/userIndex/$(request.auth.uid))
-              && get(/databases/$(database)/documents/userIndex/$(request.auth.uid)).data.tenantId == tenantId
-          ));
-        
-        allow create: if request.auth != null && (isSuperAdmin() || !isSuperAdmin());
-        
-        allow update: if request.auth != null
-          && (isSuperAdmin() || (
-              exists(/databases/$(database)/documents/userIndex/$(request.auth.uid))
-              && get(/databases/$(database)/documents/userIndex/$(request.auth.uid)).data.tenantId == tenantId
-          ));
-          
-        allow delete: if isSuperAdmin();
+      // Users: firm staff see everyone; a user can read and touch their own lastLogin
+      match /users/{userId} {
+        allow read: if isSuperAdmin() || isFirmStaff(tenantId)
+          || (request.auth != null && request.auth.uid == userId && isTenantMember(tenantId));
+        allow create, delete: if isSuperAdmin() || isFirmAdmin(tenantId);
+        allow update: if isSuperAdmin() || isFirmAdmin(tenantId)
+          || (request.auth != null && request.auth.uid == userId && isTenantMember(tenantId)
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastLogin']));
+      }
 
-        // Nested sub-collections (e.g. reports/{id}/findings/{id})
-        match /{nestedCol}/{nestedDoc} {
-          allow read: if request.auth != null
-            && (isSuperAdmin() || (
-                exists(/databases/$(database)/documents/userIndex/$(request.auth.uid))
-                && get(/databases/$(database)/documents/userIndex/$(request.auth.uid)).data.tenantId == tenantId
-            ));
-            
-          allow write: if request.auth != null
-            && (isSuperAdmin() || (
-                exists(/databases/$(database)/documents/userIndex/$(request.auth.uid))
-                && get(/databases/$(database)/documents/userIndex/$(request.auth.uid)).data.tenantId == tenantId
-            ));
+      // Client organisations: readable by members (clients need their own org name)
+      match /clientOrgs/{orgId} {
+        allow read: if isSuperAdmin() || isFirmStaff(tenantId) || isClientOf(tenantId, orgId);
+        allow write: if isSuperAdmin() || isFirmAdmin(tenantId);
+      }
+
+      // Reports: firm staff manage; clients read only their organisation's reports
+      match /reports/{reportId} {
+        allow read: if isSuperAdmin() || isFirmStaff(tenantId)
+          || isClientOf(tenantId, resource.data.get('clientOrgId', null));
+        allow create, update: if isSuperAdmin() || isFirmStaff(tenantId);
+        allow delete: if isSuperAdmin() || isFirmAdmin(tenantId);
+
+        // Cached AI analysis
+        match /analysis/{docId} {
+          allow read: if isSuperAdmin() || isFirmStaff(tenantId)
+            || isClientOf(tenantId, reportOrg(tenantId, reportId));
+          allow write: if isSuperAdmin() || isFirmStaff(tenantId);
         }
+
+        // Findings: clients (admin/technical) may only move the remediation workflow
+        match /findings/{findingId} {
+          allow read: if isSuperAdmin() || isFirmStaff(tenantId)
+            || isClientOf(tenantId, reportOrg(tenantId, reportId));
+          allow create, delete: if isSuperAdmin() || isFirmStaff(tenantId);
+          allow update: if isSuperAdmin() || isFirmStaff(tenantId)
+            || (isClientRemediator(tenantId, reportOrg(tenantId, reportId)) && onlyRemediationFieldsChanged());
+        }
+      }
+
+      // Anything else under a tenant (audit logs, stats, ...): firm staff only
+      match /{subcollection}/{docId} {
+        allow read, write: if isSuperAdmin() || isFirmStaff(tenantId);
       }
     }
   }

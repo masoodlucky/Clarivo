@@ -16,6 +16,7 @@ import FirmDashboard from './pages/FirmDashboard'
 import ClientDashboard from './pages/ClientDashboard'
 import ReportUpload from './pages/ReportUpload'
 import ReportViewer from './pages/ReportViewer'
+import ReportsList from './pages/ReportsList'
 import RemediationTracker from './pages/RemediationTracker'
 import AuditLog from './pages/AuditLog'
 import DeploymentHealth from './pages/DeploymentHealth'
@@ -60,7 +61,7 @@ function AuthenticatedApp() {
           <TenantRoute><ReportViewer /></TenantRoute>
         } />
         <Route path="/reports" element={
-          <TenantRoute><ReportViewer /></TenantRoute>
+          <TenantRoute><ReportsList /></TenantRoute>
         } />
 
         {/* Operations */}

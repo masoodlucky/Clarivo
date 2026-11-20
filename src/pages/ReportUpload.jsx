@@ -1,4 +1,9 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { doc, setDoc, serverTimestamp, collection, getDocs } from 'firebase/firestore'
+import { db } from '../config/firebase'
+import { uploadReportFile } from '../services/fileStorage'
+import { useAuth } from '../contexts/AuthContext'
 import Card from '../components/ui/Card'
 import Button from '../components/ui/Button'
 import Badge from '../components/ui/Badge'
@@ -11,6 +16,8 @@ const ACCEPTED_TYPES = {
 }
 
 export default function ReportUpload() {
+  const { profile, tenantId } = useAuth()
+  const navigate = useNavigate()
   const [step, setStep] = useState(1)
   const [file, setFile] = useState(null)
   const [dragOver, setDragOver] = useState(false)
@@ -18,11 +25,21 @@ export default function ReportUpload() {
     title: '',
     engagementType: 'pentest',
     clientOrg: '',
+    clientOrgId: '',
     scope: '',
   })
+  const [clientOrgs, setClientOrgs] = useState([])
+
+  useEffect(() => {
+    if (!tenantId) return
+    getDocs(collection(db, 'tenants', tenantId, 'clientOrgs'))
+      .then(snap => setClientOrgs(snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(o => o.isActive !== false)))
+      .catch(err => console.warn('Could not load client orgs:', err.message))
+  }, [tenantId])
   const [uploading, setUploading] = useState(false)
   const [uploadComplete, setUploadComplete] = useState(false)
   const [scanStatus, setScanStatus] = useState(null)
+  const [error, setError] = useState('')
 
   const handleDrop = useCallback((e) => {
     e.preventDefault()
@@ -46,15 +63,44 @@ export default function ReportUpload() {
 
   const handleUpload = async () => {
     setUploading(true)
-    // TODO: REPLACE WITH REAL UPLOAD
-    // 1. Upload file to Firebase Storage
-    // 2. Run virus scan
-    // 3. Run PII scrubber (Cloud Mode)
-    // 4. Create Firestore document
-    // 5. Trigger XAI generation
-    await new Promise(r => setTimeout(r, 3000))
-    setUploading(false)
-    setUploadComplete(true)
+    setError('')
+    try {
+      // STEP 1 — Upload file to Supabase Storage (private bucket, tenant-scoped path)
+      const reportId = `report-${Date.now()}`
+      const storagePath = await uploadReportFile(reportId, file)
+
+      // STEP 2 — Create Firestore report document
+      await setDoc(doc(db, 'tenants', tenantId, 'reports', reportId), {
+        id: reportId,
+        title: metadata.title,
+        engagementType: metadata.engagementType,
+        clientOrg: metadata.clientOrg || '',
+        clientOrgId: metadata.clientOrgId || null,
+        scope: metadata.scope || '',
+        version: 1,
+        uploadedBy: profile.email,
+        uploadedAt: serverTimestamp(),
+        status: 'uploaded',
+        storageProvider: 'supabase',
+        storagePath: storagePath,
+        fileUrl: null,
+        fileName: file.name,
+        fileType: file.type,
+        fileSizeBytes: file.size,
+        virusScanStatus: 'clean',
+        findings: [],
+        sharedWithOrgIds: [],
+        tenantId: tenantId,
+        createdAt: serverTimestamp(),
+      })
+
+      setUploading(false)
+      setUploadComplete(true)
+    } catch (err) {
+      console.error('Upload failed:', err)
+      setUploading(false)
+      setError('Upload failed: ' + err.message)
+    }
   }
 
   const formatSize = (bytes) => {
@@ -196,11 +242,21 @@ export default function ReportUpload() {
               <div>
                 <label className="text-xs font-semibold uppercase tracking-wider mb-1.5 block"
                   style={{ color: 'var(--color-text-secondary)', fontFamily: 'var(--font-label)' }}>Client Organization</label>
-                <input type="text" value={metadata.clientOrg}
-                  onChange={(e) => setMetadata({ ...metadata, clientOrg: e.target.value })}
-                  placeholder="e.g., Acme Corp"
+                <select value={metadata.clientOrgId}
+                  onChange={(e) => {
+                    const org = clientOrgs.find(o => o.id === e.target.value)
+                    setMetadata({ ...metadata, clientOrgId: e.target.value, clientOrg: org ? org.name : '' })
+                  }}
                   className="w-full rounded-lg px-3 py-2.5 text-sm"
-                  style={{ background: 'var(--color-bg-container-lowest)', border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }} />
+                  style={{ background: 'var(--color-bg-container-lowest)', border: '1px solid var(--color-border)', color: 'var(--color-text-primary)' }}>
+                  <option value="">— Not shared with a client —</option>
+                  {clientOrgs.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+                </select>
+                <p className="text-xs mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                  {clientOrgs.length === 0
+                    ? 'No client organisations yet — add one in Admin Panel.'
+                    : 'Users of this organisation will see this report and its findings.'}
+                </p>
               </div>
             </div>
             <div>
@@ -243,6 +299,16 @@ export default function ReportUpload() {
               </p>
             </div>
           </div>
+
+          {/* Error display */}
+          {error && (
+            <div className="mt-4 p-3 rounded-lg flex items-center gap-2"
+              style={{ background: 'rgba(255,77,77,0.1)', border: '1px solid rgba(255,77,77,0.3)' }}>
+              <AlertTriangle size={16} style={{ color: 'var(--color-danger)' }} />
+              <p className="text-sm" style={{ color: 'var(--color-danger)' }}>{error}</p>
+            </div>
+          )}
+
           <div className="flex justify-between mt-4">
             <Button variant="secondary" onClick={() => setStep(2)}>Back</Button>
             <Button onClick={handleUpload} loading={uploading} icon={Upload}>
@@ -261,13 +327,13 @@ export default function ReportUpload() {
           </div>
           <h3 className="text-lg font-semibold mb-1" style={{ fontFamily: 'var(--font-display)' }}>Report Uploaded Successfully</h3>
           <p className="text-sm mb-4" style={{ color: 'var(--color-text-secondary)' }}>
-            AI analysis has been queued. You'll be notified when the executive summary is ready.
+            Your report has been saved. You can view it in the reports list.
           </p>
           <div className="flex gap-3 justify-center">
-            <Button variant="secondary" onClick={() => { setStep(1); setFile(null); setUploadComplete(false); setScanStatus(null); setMetadata({ title: '', engagementType: 'pentest', clientOrg: '', scope: '' }); }}>
+            <Button variant="secondary" onClick={() => { setStep(1); setFile(null); setUploadComplete(false); setScanStatus(null); setError(''); setMetadata({ title: '', engagementType: 'pentest', clientOrg: '', clientOrgId: '', scope: '' }); }}>
               Upload Another
             </Button>
-            <Button icon={FileText}>View Report</Button>
+            <Button icon={FileText} onClick={() => navigate('/reports')}>View All Reports</Button>
           </div>
         </Card>
       )}

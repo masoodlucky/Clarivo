@@ -18,16 +18,16 @@ export default function AuthRedirect() {
       return
     }
 
-    if (profile?.role) {
-      navigate(getDefaultRoute(profile.role), { replace: true })
+    if (profile?.role || profile?.accountType) {
+      navigate(getDefaultRoute(profile.role, profile.accountType), { replace: true })
     } else {
       // Profile not loaded yet — wait and retry
       const timer = setTimeout(() => {
-        if (profile?.role) {
-          navigate(getDefaultRoute(profile.role), { replace: true })
+        if (profile?.role || profile?.accountType) {
+          navigate(getDefaultRoute(profile.role, profile.accountType), { replace: true })
         } else {
           // Fallback after timeout
-          navigate('/dashboard/firm', { replace: true })
+          navigate('/login', { replace: true })
         }
       }, 2000)
       return () => clearTimeout(timer)

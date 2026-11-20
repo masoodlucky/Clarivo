@@ -18,7 +18,7 @@ export default function Login() {
   const [forgotLoading, setForgotLoading] = useState(false)
   const [forgotSent, setForgotSent] = useState(false)
 
-  const { login, resetPassword } = useAuth()
+  const { login, logout, resetPassword } = useAuth()
   const navigate = useNavigate()
 
   const handleSubmit = async (e) => {
@@ -28,7 +28,21 @@ export default function Login() {
     setLoading(true)
     try {
       await login(email, password)
-      // onAuthStateChanged triggers profile resolution → AuthRedirect handles routing
+
+      // Gate: block super admin accounts from tenant login
+      const { doc, getDoc } = await import('firebase/firestore')
+      const { auth: firebaseAuth, db } = await import('../config/firebase')
+      const uid = firebaseAuth.currentUser?.uid
+      if (uid) {
+        const indexSnap = await getDoc(doc(db, 'userIndex', uid))
+        if (indexSnap.exists() && indexSnap.data().accountType === 'super_admin') {
+          await logout()
+          setError('This is a platform admin account. Please use the Super Admin portal at /super-admin/login')
+          return
+        }
+      }
+
+      // Normal tenant user → route via AuthRedirect
       setTimeout(() => navigate('/auth-redirect'), 300)
     } catch (err) {
       setError(err.message)

@@ -1,14 +1,18 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { initializeApp, deleteApp } from 'firebase/app'
 import {
+  getAuth as getAuthInstance,
   createUserWithEmailAndPassword,
   sendPasswordResetEmail,
 } from 'firebase/auth'
 import {
   doc,
   setDoc,
+  getDoc,
   getDocs,
+  deleteDoc,
   updateDoc,
   collection,
   serverTimestamp,
@@ -33,6 +37,7 @@ import {
   Users,
   Database,
   Activity,
+  Trash2,
 } from 'lucide-react'
 
 const PLANS = ['free', 'professional', 'enterprise']
@@ -97,16 +102,44 @@ export default function SuperAdminDashboard() {
     setLoading(true)
     setResult(null)
 
+    let secondaryApp = null
+
     try {
       // 1. Generate tenantId
       const slug = firmName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
       const randomSuffix = Math.random().toString(36).substring(2, 8)
       const tenantId = `${slug}-${randomSuffix}`
 
-      // 2. Create temp auth account
-      const tempPassword = `Clarivo_${Math.random().toString(36).substring(2, 14)}!`
-      const cred = await createUserWithEmailAndPassword(auth, adminEmail, tempPassword)
-      const uid = cred.user.uid
+      let uid = null
+
+      // 2. Try to create a new auth account using a SECONDARY app
+      try {
+        const tempPassword = `Clarivo_${Math.random().toString(36).substring(2, 14)}!`
+        secondaryApp = initializeApp(auth.app.options, 'TempCreateUser')
+        const secondaryAuth = getAuthInstance(secondaryApp)
+        const cred = await createUserWithEmailAndPassword(secondaryAuth, adminEmail, tempPassword)
+        uid = cred.user.uid
+      } catch (authErr) {
+        if (authErr.code === 'auth/email-already-in-use') {
+          // Firebase Auth account exists (possibly from a previously deleted tenant).
+          // Look up the orphaned userIndex to recover the UID.
+          const { query, where } = await import('firebase/firestore')
+          const q = query(collection(db, 'userIndex'), where('email', '==', adminEmail))
+          const snap = await getDocs(q)
+          if (!snap.empty) {
+            uid = snap.docs[0].data().uid || snap.docs[0].id
+          } else {
+            // No userIndex found — truly orphaned. Cannot recover UID from client SDK.
+            setResult({
+              type: 'error',
+              message: `Auth account for ${adminEmail} exists but cannot be recovered. Delete it from Firebase Console → Authentication, then retry.`
+            })
+            return
+          }
+        } else {
+          throw authErr
+        }
+      }
 
       // 3. Create tenant
       await setDoc(doc(db, 'tenants', tenantId), {
@@ -117,7 +150,7 @@ export default function SuperAdminDashboard() {
         domain: adminEmail.split('@')[1] || '',
         piiScrubberEnabled: true,
         lofiModeActive: false,
-        isActive: true, // firm active toggle
+        isActive: true,
         ollamaModel: 'mistral:7b',
         ollamaEndpoint: 'http://localhost:11434',
         createdAt: serverTimestamp(),
@@ -137,16 +170,20 @@ export default function SuperAdminDashboard() {
         lastLogin: null,
       })
 
-      // 5. Create userIndex for normal tenant routing
+      // 5. Update userIndex (create or re-activate from orphaned state)
       await setDoc(doc(db, 'userIndex', uid), {
         uid,
         tenantId,
         email: adminEmail,
-        accountType: 'tenant_user' // Crucial distinction
-      })
+        accountType: 'tenant_user',
+        orphaned: false,
+      }, { merge: true })
 
-      // 6. Send invite (reset password)
-      await sendPasswordResetEmail(auth, adminEmail)
+      // 6. Send invite (reset password) with redirect URL
+      await sendPasswordResetEmail(auth, adminEmail, {
+        url: `${window.location.origin}/login`,
+        handleCodeInApp: false,
+      })
 
       setResult({
         type: 'success',
@@ -166,6 +203,9 @@ export default function SuperAdminDashboard() {
       }
       setResult({ type: 'error', message: msg })
     } finally {
+      if (secondaryApp) {
+        deleteApp(secondaryApp).catch(() => {})
+      }
       setLoading(false)
     }
   }
@@ -178,6 +218,66 @@ export default function SuperAdminDashboard() {
       await loadDashboardData()
     } catch (err) {
       console.error('Suspend toggle failed:', err)
+    }
+  }
+
+  async function deleteTenantData(firmId) {
+    // 1. Get all users under this tenant
+    const usersSnap = await getDocs(collection(db, 'tenants', firmId, 'users'))
+    
+    // 2. Orphan each user's userIndex (don't delete — Firebase Auth account still exists
+    //    and we need the email→UID mapping for re-creation)
+    for (const userDoc of usersSnap.docs) {
+      const uid = userDoc.id
+      await updateDoc(doc(db, 'userIndex', uid), {
+        tenantId: null,
+        orphaned: true,
+      }).catch(() => {})
+      await deleteDoc(doc(db, 'tenants', firmId, 'users', uid)).catch(() => {})
+    }
+
+    // 3. Delete other known subcollections
+    const subcollections = ['reports', 'findings', 'xaiResults', 'dashboardStats', 'clientOrgs']
+    for (const sub of subcollections) {
+      const snap = await getDocs(collection(db, 'tenants', firmId, sub)).catch(() => null)
+      if (snap) {
+        for (const d of snap.docs) {
+          await deleteDoc(doc(db, 'tenants', firmId, sub, d.id)).catch(() => {})
+        }
+      }
+    }
+
+    // 4. Delete the tenant document itself
+    await deleteDoc(doc(db, 'tenants', firmId))
+  }
+
+  async function handleDeleteFirm(firmId, firmName) {
+    if (!window.confirm(`Permanently delete "${firmName}" and all its data? This cannot be undone.`)) return
+    try {
+      await deleteTenantData(firmId)
+      setResult({ type: 'success', message: `${firmName} deleted successfully.` })
+      await loadDashboardData()
+    } catch (err) {
+      console.error('Delete firm failed:', err)
+      setResult({ type: 'error', message: `Failed to delete: ${err.message}` })
+    }
+  }
+
+  async function handleClearAllFirms() {
+    if (!window.confirm(`DELETE ALL FIRMS? This will permanently remove every tenant and all their data. This cannot be undone.`)) return
+    if (!window.confirm(`Are you ABSOLUTELY sure? Type confirms will not bring data back.`)) return
+    try {
+      setLoading(true)
+      for (const firm of firms) {
+        await deleteTenantData(firm.id)
+      }
+      setResult({ type: 'success', message: `All ${firms.length} firms deleted.` })
+      await loadDashboardData()
+    } catch (err) {
+      console.error('Clear all failed:', err)
+      setResult({ type: 'error', message: `Clear all failed: ${err.message}` })
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -322,17 +422,24 @@ export default function SuperAdminDashboard() {
             <Card 
               title="All Firms" 
               icon={Building}
-              headerAction={
-                <Button variant="ghost" size="sm" icon={RefreshCw} onClick={loadDashboardData} loading={dataLoading}>
-                  Refresh
-                </Button>
+              headerRight={
+                <div className="flex gap-2">
+                  {firms.length > 0 && (
+                    <Button variant="danger" size="sm" icon={Trash2} onClick={handleClearAllFirms}>
+                      Clear All
+                    </Button>
+                  )}
+                  <Button variant="ghost" size="sm" icon={RefreshCw} onClick={loadDashboardData} loading={dataLoading}>
+                    Refresh
+                  </Button>
+                </div>
               }
             >
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr style={{ borderBottom: '1px solid #1f2937' }}>
-                      {['Firm Name', 'Plan', 'Mode', 'Admin Email', 'Status', 'Actions'].map((h) => (
+                      {['Firm Name', 'Plan', 'Mode', 'Domain', 'Status', 'Actions'].map((h) => (
                         <th key={h} className="text-left px-3 py-3 text-xs font-semibold uppercase tracking-wider" style={{ color: '#8892A4' }}>{h}</th>
                       ))}
                     </tr>
@@ -362,13 +469,23 @@ export default function SuperAdminDashboard() {
                             </span>
                           </td>
                           <td className="px-3 py-4">
-                            <button
-                              onClick={() => handleToggleSuspend(f.id, f.isActive !== false)}
-                              className="text-xs font-medium cursor-pointer transition-colors"
-                              style={{ color: f.isActive !== false ? '#FF4D4D' : '#00E676', background: 'transparent', border: 'none' }}
-                            >
-                              {f.isActive !== false ? 'Suspend' : 'Activate'}
-                            </button>
+                            <div className="flex items-center gap-3">
+                              <button
+                                onClick={() => handleToggleSuspend(f.id, f.isActive !== false)}
+                                className="text-xs font-medium cursor-pointer transition-colors"
+                                style={{ color: f.isActive !== false ? '#FF4D4D' : '#00E676', background: 'transparent', border: 'none' }}
+                              >
+                                {f.isActive !== false ? 'Suspend' : 'Activate'}
+                              </button>
+                              <button
+                                onClick={() => handleDeleteFirm(f.id, f.name || f.id)}
+                                className="text-xs font-medium cursor-pointer transition-colors flex items-center gap-1"
+                                style={{ color: '#FF4D4D', background: 'transparent', border: 'none', opacity: 0.7 }}
+                                title="Permanently delete this firm"
+                              >
+                                <Trash2 size={12} /> Delete
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))

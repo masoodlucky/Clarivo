@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import Input from '../components/ui/Input'
@@ -12,8 +12,16 @@ export default function SuperAdminLogin() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  const { login } = useAuth()
+  const { login, logout, profile, user, loading: authLoading, forceResolveProfile } = useAuth()
   const navigate = useNavigate()
+
+  // If already logged in as super admin, redirect immediately
+  useEffect(() => {
+    if (authLoading) return
+    if (user && profile?.accountType === 'super_admin') {
+      navigate('/super-admin/dashboard', { replace: true })
+    }
+  }, [user, profile, authLoading, navigate])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -22,10 +30,53 @@ export default function SuperAdminLogin() {
     setLoading(true)
     
     try {
-      // AuthContext handles the routing logic via onAuthStateChanged and AuthRedirect equivalents 
-      // where it will check accountType === 'super_admin'
       await login(email, password)
-      setTimeout(() => navigate('/auth-redirect'), 200)
+
+      // Gate: verify this account IS a super admin
+      const { doc, getDoc, setDoc } = await import('firebase/firestore')
+      const { auth: firebaseAuth, db } = await import('../config/firebase')
+      const uid = firebaseAuth.currentUser?.uid
+      if (!uid) {
+        setError('Authentication failed. Please try again.')
+        return
+      }
+
+      const indexSnap = await getDoc(doc(db, 'userIndex', uid))
+      const indexData = indexSnap.exists() ? indexSnap.data() : null
+
+      let isSuperAdmin = false
+
+      if (indexData?.accountType === 'super_admin') {
+        isSuperAdmin = true
+      } else {
+        // Fallback: check /superAdmins/{uid} directly
+        const superSnap = await getDoc(doc(db, 'superAdmins', uid))
+        if (superSnap.exists()) {
+          // Auto-heal the userIndex
+          await setDoc(doc(db, 'userIndex', uid), {
+            uid,
+            tenantId: null,
+            email: email,
+            accountType: 'super_admin'
+          }, { merge: true })
+          isSuperAdmin = true
+        }
+      }
+
+      if (!isSuperAdmin) {
+        await logout()
+        setError('This account is not authorized for platform administration. Use the standard login portal.')
+        return
+      }
+
+      // Force the AuthContext to re-resolve the profile with correct super_admin type
+      // This ensures SuperAdminRoute won't see a stale/null profile
+      await forceResolveProfile()
+
+      // Small delay to ensure React state propagates before navigation
+      setTimeout(() => {
+        navigate('/super-admin/dashboard', { replace: true })
+      }, 100)
     } catch (err) {
       setError(err.message)
     } finally {

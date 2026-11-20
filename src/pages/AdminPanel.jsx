@@ -3,7 +3,10 @@ import { useAuth } from '../contexts/AuthContext'
 import {
   createUserWithEmailAndPassword,
   sendPasswordResetEmail,
+  getAuth as getAuthInstance,
+  signOut,
 } from 'firebase/auth'
+import { initializeApp, deleteApp } from 'firebase/app'
 import {
   doc,
   setDoc,
@@ -52,6 +55,25 @@ const INVITABLE_ROLES = [
   ROLES.CLIENT_TECHNICAL,
 ]
 
+// One-line explanation shown under the role picker
+const ROLE_HINTS = {
+  [ROLES.ANALYST]: 'Your firm\'s team member — uploads reports, runs AI analysis, sees every client.',
+  [ROLES.CLIENT_ADMIN]: 'Client lead (e.g. CISO / CTO) — sees their organisation\'s reports and can update fix status.',
+  [ROLES.CLIENT_TECHNICAL]: 'Client engineer — sees technical detail and updates fix status and assignees.',
+  [ROLES.CLIENT_VIEWER]: 'Client stakeholder (e.g. CEO) — read-only access to reports and dashboards.',
+}
+
+/** Normalise a name for fuzzy matching: "Prudent Bit Pvt Ltd" → "prudentbit" */
+function normName(s) {
+  return (s || '').toLowerCase()
+    .replace(/\b(pvt|private|ltd|limited|inc|llc|llp|corp|corporation|co|technologies|tech)\b/g, '')
+    .replace(/[^a-z0-9]/g, '')
+}
+
+function slugify(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+}
+
 export default function AdminPanel() {
   const { profile, tenantId } = useAuth()
 
@@ -75,13 +97,69 @@ export default function AdminPanel() {
   const [showAddOrg, setShowAddOrg] = useState(false)
   const [newOrgName, setNewOrgName] = useState('')
   const [addOrgLoading, setAddOrgLoading] = useState(false)
+  const [orgError, setOrgError] = useState('')
+  // After creating an org: offer to share matching reports / invite a user
+  const [orgNotice, setOrgNotice] = useState(null) // { org, matches: [report] }
+  const [linking, setLinking] = useState(false)
+
+  // Reports (used for org-name suggestions and one-click sharing)
+  const [reports, setReports] = useState([])
 
   useEffect(() => {
     if (tenantId) {
       loadUsers()
       loadClientOrgs()
+      loadReports()
     }
   }, [tenantId])
+
+  async function loadReports() {
+    try {
+      const snap = await getDocs(collection(db, 'tenants', tenantId, 'reports'))
+      setReports(snap.docs.map((d) => ({ id: d.id, ...d.data() })))
+    } catch (err) {
+      console.warn('Could not load reports for suggestions:', err.message)
+    }
+  }
+
+  // Client names typed on reports that don't have an organisation yet
+  const orgSuggestions = Array.from(new Map(
+    reports
+      .filter(r => r.clientOrg && !r.clientOrgId)
+      .filter(r => !clientOrgs.some(o => normName(o.name) === normName(r.clientOrg)))
+      .map(r => [normName(r.clientOrg), r.clientOrg.trim()])
+  ).values())
+
+  const duplicateOrg = newOrgName.trim()
+    ? clientOrgs.find(o => normName(o.name) === normName(newOrgName) || o.id === slugify(newOrgName))
+    : null
+
+  function reportsMatchingOrg(org) {
+    return reports.filter(r => !r.clientOrgId && r.clientOrg && normName(r.clientOrg) === normName(org.name))
+  }
+
+  async function shareReportsWithOrg(org, list) {
+    setLinking(true)
+    try {
+      await Promise.all(list.map(r => updateDoc(doc(db, 'tenants', tenantId, 'reports', r.id), {
+        clientOrgId: org.id,
+        clientOrg: org.name,
+      })))
+      await loadReports()
+      setOrgNotice(prev => prev ? { ...prev, matches: [], shared: list.length } : prev)
+    } catch (err) {
+      setOrgError('Could not share reports: ' + err.message)
+    } finally {
+      setLinking(false)
+    }
+  }
+
+  function openInviteFor(org) {
+    setInviteRole(ROLES.CLIENT_TECHNICAL)
+    setInviteClientOrg(org.id)
+    setInviteResult(null)
+    setShowInvite(true)
+  }
 
   async function loadUsers() {
     setUsersLoading(true)
@@ -106,20 +184,29 @@ export default function AdminPanel() {
 
   async function handleAddClientOrg(e) {
     e.preventDefault()
-    if (!newOrgName || !tenantId) return
+    const name = newOrgName.trim()
+    if (!name || !tenantId) return
+    if (duplicateOrg) {
+      setOrgError(`"${duplicateOrg.name}" already exists.`)
+      return
+    }
     setAddOrgLoading(true)
+    setOrgError('')
     try {
-      const orgId = newOrgName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+      const orgId = slugify(name)
       await setDoc(doc(db, 'tenants', tenantId, 'clientOrgs', orgId), {
-        name: newOrgName,
+        name,
         isActive: true,
         createdAt: serverTimestamp(),
       })
+      const org = { id: orgId, name }
       setNewOrgName('')
       setShowAddOrg(false)
+      setOrgNotice({ org, matches: reportsMatchingOrg(org) })
       await loadClientOrgs()
     } catch (err) {
       console.error('Failed to create org:', err)
+      setOrgError('Could not create organisation: ' + err.message)
     } finally {
       setAddOrgLoading(false)
     }
@@ -128,17 +215,29 @@ export default function AdminPanel() {
   async function handleInviteUser(e) {
     e.preventDefault()
     if (!inviteName || !inviteEmail || !tenantId) return
+    const isClientRole = !isFirmRole(inviteRole)
+    if (isClientRole && !inviteClientOrg) {
+      setInviteResult({ type: 'error', message: 'Client users must be linked to a client organisation.' })
+      return
+    }
     setInviteLoading(true)
     setInviteResult(null)
 
+    let secondaryApp = null
+    let newUser = null      // auth account created by this attempt
+    let profileWritten = false
+    let completed = false
     try {
-      // 1. Create Firebase Auth account with temp password
-      const tempPassword = `Clarivo_${Math.random().toString(36).substring(2, 14)}!`
-      const cred = await createUserWithEmailAndPassword(auth, inviteEmail, tempPassword)
+      // 1. Create the Firebase Auth account on a SECONDARY app instance, so the
+      //    admin's own session is not replaced by the newly created user.
+      const tempPassword = `Clarivo_${crypto.getRandomValues(new Uint32Array(2)).join('')}!aA`
+      secondaryApp = initializeApp(auth.app.options, `Invite-${Date.now()}`)
+      const secondaryAuth = getAuthInstance(secondaryApp)
+      const cred = await createUserWithEmailAndPassword(secondaryAuth, inviteEmail, tempPassword)
+      newUser = cred.user
       const uid = cred.user.uid
 
-      // 2. Create user profile under tenant
-      const isClientRole = !isFirmRole(inviteRole)
+      // 2. Create user profile under tenant (written as the admin)
       await setDoc(doc(db, 'tenants', tenantId, 'users', uid), {
         email: inviteEmail,
         displayName: inviteName,
@@ -151,13 +250,17 @@ export default function AdminPanel() {
         createdAt: serverTimestamp(),
         lastLogin: null,
       })
+      profileWritten = true
 
       // 3. Create userIndex entry
       await setDoc(doc(db, 'userIndex', uid), {
         uid,
         tenantId,
         email: inviteEmail,
+        accountType: 'tenant_user',
       })
+      completed = true
+      await signOut(secondaryAuth).catch(() => {})
 
       // 4. Send password reset email (= "Set your password" invite)
       await sendPasswordResetEmail(auth, inviteEmail)
@@ -179,12 +282,20 @@ export default function AdminPanel() {
         setInviteResult(null)
       }, 2000)
     } catch (err) {
+      // Roll back a half-finished invite so the same email can be retried
+      if (newUser && !completed) {
+        if (profileWritten) await deleteDoc(doc(db, 'tenants', tenantId, 'users', newUser.uid)).catch(() => {})
+        await newUser.delete().catch(() => {})
+      }
       let msg = err.message
       if (err.code === 'auth/email-already-in-use') {
-        msg = 'An account with this email already exists.'
+        msg = 'This email already has a Clarivo login (possibly in another firm). Use a different email, e.g. name+client@gmail.com.'
+      } else if (err.code === 'permission-denied' || /insufficient permissions/i.test(msg)) {
+        msg = 'Permission denied by the database rules. Publish the latest firestore.rules in Firebase Console and try again.'
       }
       setInviteResult({ type: 'error', message: msg })
     } finally {
+      if (secondaryApp) deleteApp(secondaryApp).catch(() => {})
       setInviteLoading(false)
     }
   }
@@ -201,6 +312,16 @@ export default function AdminPanel() {
   }
 
   const isClientRole = (role) => !isFirmRole(role)
+
+  // Invite form helpers: duplicate email warning + org suggested by email domain
+  const inviteEmailNorm = inviteEmail.trim().toLowerCase()
+  const existingInviteUser = inviteEmailNorm
+    ? users.find(u => (u.email || '').toLowerCase() === inviteEmailNorm)
+    : null
+  const inviteDomain = inviteEmailNorm.includes('@') ? inviteEmailNorm.split('@')[1].split('.')[0] : ''
+  const suggestedOrg = isClientRole(inviteRole) && inviteDomain && !['gmail', 'outlook', 'hotmail', 'yahoo', 'icloud', 'proton', 'protonmail'].includes(inviteDomain)
+    ? clientOrgs.find(o => normName(o.name) && (normName(inviteDomain).includes(normName(o.name)) || normName(o.name).includes(normName(inviteDomain))))
+    : null
 
   return (
     <div className="space-y-6">
@@ -252,47 +373,117 @@ export default function AdminPanel() {
         title="Client Organisations"
         icon={Building}
         subtitle="Manage client organisations under your firm"
-        headerAction={
+        headerRight={
           <Button variant="outline" size="sm" icon={Plus} onClick={() => setShowAddOrg(true)}>
             Add Org
           </Button>
         }
       >
         {showAddOrg && (
-          <form onSubmit={handleAddClientOrg} className="flex items-end gap-3 mb-4 p-3 rounded-lg" style={{ background: 'var(--color-bg-container)' }}>
-            <div className="flex-1">
-              <Input
-                label="Organisation Name"
-                type="text"
-                placeholder="Acme Corp"
-                value={newOrgName}
-                onChange={(e) => setNewOrgName(e.target.value)}
-                icon={Building}
-                required
-              />
+          <form onSubmit={handleAddClientOrg} className="mb-4 p-3 rounded-lg" style={{ background: 'var(--color-bg-container)' }}>
+            <div className="flex items-end gap-3">
+              <div className="flex-1">
+                <Input
+                  label="Organisation Name"
+                  type="text"
+                  placeholder="Client company name, e.g. Acme Corp"
+                  value={newOrgName}
+                  onChange={(e) => { setNewOrgName(e.target.value); setOrgError('') }}
+                  icon={Building}
+                  required
+                />
+              </div>
+              <Button type="submit" size="sm" loading={addOrgLoading} disabled={!!duplicateOrg}>Create</Button>
+              <Button variant="ghost" size="sm" icon={X} onClick={() => { setShowAddOrg(false); setOrgError('') }} />
             </div>
-            <Button type="submit" size="sm" loading={addOrgLoading}>Create</Button>
-            <Button variant="ghost" size="sm" icon={X} onClick={() => setShowAddOrg(false)} />
+            {duplicateOrg && (
+              <p className="text-xs mt-2" style={{ color: 'var(--color-warning)' }}>
+                "{duplicateOrg.name}" already exists — use it instead of creating a duplicate.
+              </p>
+            )}
+            {orgSuggestions.length > 0 && (
+              <div className="mt-3">
+                <p className="text-xs mb-1.5" style={{ color: 'var(--color-text-muted)' }}>Suggested from client names on your reports:</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {orgSuggestions.map(s => (
+                    <button key={s} type="button" onClick={() => { setNewOrgName(s); setOrgError('') }}
+                      className="text-xs px-2.5 py-1 rounded-full cursor-pointer"
+                      style={{ background: 'var(--color-primary-glow)', color: 'var(--color-primary)', border: '1px solid var(--color-primary-border)' }}>
+                      + {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </form>
         )}
+
+        {orgError && (
+          <p className="text-xs mb-3" style={{ color: 'var(--color-danger)' }}>{orgError}</p>
+        )}
+
+        {/* Next steps after creating an org */}
+        {orgNotice && (
+          <div className="mb-4 p-3 rounded-lg text-sm flex flex-col gap-2"
+            style={{ background: 'rgba(0,230,118,0.06)', border: '1px solid rgba(0,230,118,0.25)' }}>
+            <div className="flex items-start justify-between gap-2">
+              <p style={{ color: 'var(--color-text-primary)' }}>
+                <CheckCircle size={14} className="inline mr-1.5" style={{ color: 'var(--color-success)' }} />
+                <strong>{orgNotice.org.name}</strong> created.
+                {orgNotice.shared ? ` ${orgNotice.shared} report${orgNotice.shared > 1 ? 's' : ''} shared with them.` : ''} Next steps:
+              </p>
+              <button onClick={() => setOrgNotice(null)} className="cursor-pointer" style={{ background: 'none', border: 'none', color: 'var(--color-text-muted)' }}>
+                <X size={14} />
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {orgNotice.matches?.length > 0 && (
+                <Button size="sm" variant="outline" loading={linking} onClick={() => shareReportsWithOrg(orgNotice.org, orgNotice.matches)}>
+                  Share {orgNotice.matches.length} matching report{orgNotice.matches.length > 1 ? 's' : ''} with {orgNotice.org.name}
+                </Button>
+              )}
+              <Button size="sm" icon={UserPlus} onClick={() => openInviteFor(orgNotice.org)}>
+                Invite a {orgNotice.org.name} user
+              </Button>
+            </div>
+          </div>
+        )}
+
         {clientOrgs.length === 0 ? (
           <p className="text-sm py-4" style={{ color: 'var(--color-text-muted)' }}>
-            No client organisations yet. Create one to invite client users.
+            No client organisations yet. Click <strong>Add Org</strong> to create one, then invite its users.
           </p>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {clientOrgs.map((org) => (
-              <div
-                key={org.id}
-                className="flex items-center gap-3 px-4 py-3 rounded-lg"
-                style={{ background: 'var(--color-bg-container)', border: '1px solid var(--color-border-subtle)' }}
-              >
-                <Building size={16} style={{ color: 'var(--color-info)' }} />
-                <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                  {org.name}
-                </span>
-              </div>
-            ))}
+            {clientOrgs.map((org) => {
+              const orgUsers = users.filter(u => u.clientOrgId === org.id).length
+              const orgReports = reports.filter(r => r.clientOrgId === org.id).length
+              const unlinked = reportsMatchingOrg(org)
+              return (
+                <div key={org.id} className="flex items-center gap-3 px-4 py-3 rounded-lg"
+                  style={{ background: 'var(--color-bg-container)', border: '1px solid var(--color-border-subtle)' }}>
+                  <Building size={16} className="shrink-0" style={{ color: 'var(--color-info)' }} />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>{org.name}</p>
+                    <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                      {orgUsers} user{orgUsers !== 1 ? 's' : ''} · {orgReports} shared report{orgReports !== 1 ? 's' : ''}
+                      {unlinked.length > 0 && (
+                        <>
+                          {' · '}
+                          <button onClick={() => { setOrgNotice({ org, matches: unlinked }); }}
+                            className="cursor-pointer" style={{ background: 'none', border: 'none', padding: 0, color: 'var(--color-warning)' }}>
+                            {unlinked.length} unshared report{unlinked.length > 1 ? 's' : ''} mention them
+                          </button>
+                        </>
+                      )}
+                    </p>
+                  </div>
+                  <Button size="sm" variant="outline" icon={UserPlus} onClick={() => openInviteFor(org)}>
+                    Invite client
+                  </Button>
+                </div>
+              )
+            })}
           </div>
         )}
       </Card>
@@ -302,7 +493,7 @@ export default function AdminPanel() {
         title="Users"
         icon={Users}
         subtitle="All firm and client users"
-        headerAction={
+        headerRight={
           <Button variant="ghost" size="sm" icon={RefreshCw} onClick={loadUsers} loading={usersLoading}>
             Refresh
           </Button>
@@ -436,10 +627,16 @@ export default function AdminPanel() {
                 type="email"
                 placeholder="arjun@company.com"
                 value={inviteEmail}
-                onChange={(e) => setInviteEmail(e.target.value)}
+                onChange={(e) => { setInviteEmail(e.target.value); setInviteResult(null) }}
                 icon={Mail}
                 required
               />
+              {existingInviteUser && (
+                <p className="text-xs -mt-2" style={{ color: 'var(--color-warning)' }}>
+                  This email already belongs to <strong>{existingInviteUser.displayName || existingInviteUser.email}</strong>
+                  {' '}({ROLE_LABELS[existingInviteUser.role] || existingInviteUser.role}) in your firm. Each person needs their own email — use a different address.
+                </p>
+              )}
 
               {/* Role Select */}
               <div>
@@ -451,7 +648,14 @@ export default function AdminPanel() {
                 </label>
                 <select
                   value={inviteRole}
-                  onChange={(e) => setInviteRole(e.target.value)}
+                  onChange={(e) => {
+                    const r = e.target.value
+                    setInviteRole(r)
+                    // Convenience: with exactly one organisation, pick it automatically
+                    if (isClientRole(r) && !inviteClientOrg && clientOrgs.length === 1) {
+                      setInviteClientOrg(clientOrgs[0].id)
+                    }
+                  }}
                   className="w-full px-3 py-2.5 rounded-lg text-sm"
                   style={{
                     background: 'var(--color-bg-container)',
@@ -460,10 +664,20 @@ export default function AdminPanel() {
                     fontFamily: 'var(--font-body)',
                   }}
                 >
-                  {INVITABLE_ROLES.map((r) => (
-                    <option key={r} value={r}>{ROLE_LABELS[r]}</option>
-                  ))}
+                  <optgroup label="Client (external)">
+                    {INVITABLE_ROLES.filter(isClientRole).map((r) => (
+                      <option key={r} value={r}>{ROLE_LABELS[r]}</option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="Your firm (internal)">
+                    {INVITABLE_ROLES.filter(r => !isClientRole(r)).map((r) => (
+                      <option key={r} value={r}>{ROLE_LABELS[r]}</option>
+                    ))}
+                  </optgroup>
                 </select>
+                {ROLE_HINTS[inviteRole] && (
+                  <p className="text-xs mt-1.5" style={{ color: 'var(--color-text-muted)' }}>{ROLE_HINTS[inviteRole]}</p>
+                )}
               </div>
 
               {/* Client Org — shown only for client roles */}
@@ -497,6 +711,15 @@ export default function AdminPanel() {
                       ))}
                     </select>
                   )}
+                  {suggestedOrg && suggestedOrg.id !== inviteClientOrg && (
+                    <button type="button" onClick={() => setInviteClientOrg(suggestedOrg.id)}
+                      className="text-xs mt-1.5 cursor-pointer" style={{ background: 'none', border: 'none', padding: 0, color: 'var(--color-primary)' }}>
+                      Suggested from email domain: {suggestedOrg.name} — use it
+                    </button>
+                  )}
+                  <p className="text-xs mt-1.5" style={{ color: 'var(--color-text-muted)' }}>
+                    They will only see reports shared with this organisation.
+                  </p>
                 </div>
               )}
 
@@ -515,9 +738,13 @@ export default function AdminPanel() {
                 </div>
               )}
 
-              <Button type="submit" fullWidth loading={inviteLoading} icon={Mail} size="lg">
+              <Button type="submit" fullWidth loading={inviteLoading} icon={Mail} size="lg"
+                disabled={!!existingInviteUser || (isClientRole(inviteRole) && !inviteClientOrg)}>
                 Send Invite
               </Button>
+              <p className="text-xs text-center" style={{ color: 'var(--color-text-muted)' }}>
+                They'll get an email with a link to set their password, then sign in at /login.
+              </p>
             </form>
           </div>
         </div>

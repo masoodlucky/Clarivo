@@ -7,11 +7,21 @@ export const ENV = {
   /** 'cloud' | 'onprem' */
   deploymentMode: import.meta.env.VITE_DEPLOYMENT_MODE || 'cloud',
 
-  /** Ollama local LLM endpoint (on-premise only) */
+  /**
+   * Which LLM backend runs the analysis: 'ollama' | 'gemini'.
+   * Defaults to Ollama in on-prem mode and Gemini in cloud mode.
+   */
+  llmProvider: (import.meta.env.VITE_LLM_PROVIDER ||
+    (import.meta.env.VITE_DEPLOYMENT_MODE === 'onprem' ? 'ollama' : 'gemini')).toLowerCase(),
+
+  /** Ollama LLM endpoint (local Ollama server) */
   ollamaEndpoint: import.meta.env.VITE_OLLAMA_ENDPOINT || 'http://localhost:11434',
 
   /** Ollama model name */
-  ollamaModel: import.meta.env.VITE_OLLAMA_MODEL || 'mistral:7b',
+  ollamaModel: import.meta.env.VITE_OLLAMA_MODEL || 'qwen3:8b',
+
+  /** Gemini API key for cloud LLM */
+  geminiApiKey: import.meta.env.VITE_GEMINI_API_KEY || '',
 
   /** Optional NIST NVD API key for higher rate limits */
   nvdApiKey: import.meta.env.VITE_NVD_API_KEY || '',
